@@ -24,9 +24,7 @@ qm9-qinn/
 ├── data_processors/
 │   └── h5_maker_qm9.py         # One-time HDF5 dataset creation
 └── networks/
-    ├── GNN/                    # GNN, InvariantGNN, QFIMGNN (QFIM-informed classical GNN)
-    ├── GAT/
-    └── MultiplexGNN/
+    └── GNN/                    # GNN, InvariantGNN, QFIMGNN (QFIM-informed classical GNN)
 ```
 
 ---
@@ -36,7 +34,6 @@ qm9-qinn/
 - **GNN** — standard message-passing GNN baseline.
 - **InvariantGNN** — rotation/permutation-invariant variant.
 - **QFIMGNN** — classical GNN augmented with per-edge Quantum Fisher Information Matrix features precomputed from a variational quantum circuit. The QFIM features are read from the HDF5 input; no quantum computation is performed at train time.
-- **GAT**, **MultiplexGNN** — additional classical architectures.
 
 ---
 
