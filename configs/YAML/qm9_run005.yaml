@@ -1,0 +1,82 @@
+setup:
+  run_id: "run_005"
+  train: true
+  batch_size: 1
+  epochs: 50
+  shuffle: true
+  num_workers: 0
+  targets:
+    - "gap"
+  convert_pnp: false
+  seed: 42
+  train_n: 5000
+  val_n: 1000
+  test_n: null
+
+model:
+  n_qubits: 10 # number of atoms in molecule
+  read_qubits: 6
+  num_layers: 2
+  operations_per_layer: 3
+  device: "lightning.qubit"
+  backend: "autograd"
+  shots: 1000
+  extra_weights:
+    out_scale: 1.0
+    out_bias: 1.0
+    radius: 0.1
+    dist_coupling: 1.0
+    dist_coupling_2: 1.0
+    sigmoid_k: 2.0
+    sigmoid_mid: 2.0
+    bond_0: 0.0
+    bond_1: 0.0   # pi/6
+    bond_2: 0.0   # pi/3
+    bond_3: 0.0   # pi/2
+    elem_0: 0. # dummy
+    elem_1: 1. # H
+    elem_6: 0.0 # C
+    elem_7: 0.0 # N
+    elem_8: 0.0 # O
+    elem_9: 0.0 # F
+    coeff1: 1. # coefficient for calculating loss
+    coeff2: 1.
+    coeff3: 1.
+    coeff4: 1.
+    coeff5: 1.
+    coeff6: 1.
+    coeff7: 0.125
+    coeff8: 0.125
+    coeff9: 0.125
+    meas_theta_0: 0.0
+    meas_phi_0: 0.0
+    meas_theta_1: 0.0
+    meas_phi_1: 0.0
+    meas_theta_2: 0.0
+    meas_phi_2: 0.0
+    meas_theta_3: 0.0
+    meas_phi_3: 0.0
+    meas_theta_4: 0.0
+    meas_phi_4: 0.0
+    meas_theta_5: 0.0
+    meas_phi_5: 0.0
+    meas_theta_6: 0.0
+    meas_phi_6: 0.0
+    huber_delta: 1.5
+
+optimizer:
+  name: "adam"
+  lr: 0.01
+  lr_decay: true
+  decay_factor: 0.25
+  decay_patience: 3
+  decay_threshold: 0.1
+  patience: 4
+
+loss:
+  name: "huber"
+paths:
+  train: "/ceph/abal/BIO/QM9/heavymol_5-9/train/qm9_train.h5"
+  val: "/ceph/abal/BIO/QM9/heavymol_5-9/val/qm9_val.h5"
+  test: "/ceph/abal/BIO/QM9/heavymol_5-9/test/qm9_test.h5"
+  model_dir: "/work/mbinder/bioqinn/saved_models"

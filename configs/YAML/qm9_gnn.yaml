@@ -1,0 +1,50 @@
+setup:
+  run_id: "gnn_001"
+  train: true
+  batch_size: 256
+  epochs: 50
+  shuffle: true
+  num_workers: 1
+  targets:
+    - "gap"
+  seed: 42
+  train_n: null
+  val_n: null
+  test_n: null
+
+model:
+  type: "gnn_qfim"        # one of: gnn, gnn_invariant, gnn_qfim
+  node_dim: 9
+  hidden_dim: 32
+  num_layers: 6
+  include_dihedral: true
+
+# QFIM block.
+# - In-file qfim: the HDF5 files at paths.* already contain an (N, 101, 101)
+#   qfim dataset (first 60x60 = rot-gate block). The loader auto-extracts the
+#   rot-gate diagonal -> reshape (n_qubits, per_qubit_dim) per molecule.
+# - external_*_path: optional override with a standalone .npy memmap of shape
+#   (N, n_qubits * per_qubit_dim).
+qfim:
+  n_qubits: 10
+  per_qubit_dim: 6             # num_layers (2) * operations_per_layer (3)
+  # train_path: "/path/to/rotgate_train.npy"
+  # val_path:   "/path/to/rotgate_val.npy"
+  # test_path:  "/path/to/rotgate_test.npy"
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-3
+  decay_factor: 0.5
+  decay_patience: 5
+  decay_threshold: 1.0e-3
+
+loss:
+  name: "huber"
+  delta: 0.1
+
+paths:
+  train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
+  model_dir: "/ceph/mbinder/bioqinn/classical/saved_models/gnn_qfim"
