@@ -1,5 +1,5 @@
 """
-Invariant message-passing GNN for QM9, vectorized with PyTorch Geometric.
+Invariant message-passing GNN for QM9 HOMO-LUMO gap regression.
 
 Node features (9D): atomic_number, aromatic_flag, hybridisation, n_hydrogens,
                      x, y, z, n_atoms_total, n_heavy.
@@ -11,23 +11,65 @@ Rotation/translation invariance:
   using only scatter-based vectorized ops -- no Python loops -- and are
   rotation+translation invariant.
 
-All angle computations run on the device holding x; no .item() syncs.
+Target standardization:
+- The model stores (target_mean, target_std) as buffers.
+- Internally the MLP regresses on a standardized target; `forward` denormalizes
+  so callers always work in physical units (eV).
+- Fit statistics on the training split only: `model.fit_target_stats(loader)`
+  once before training. Stats save with state_dict so checkpoints / eval runs
+  don't drift.
+
+Pooling default is "mean", appropriate for the HOMO-LUMO gap (intensive).
+Switch to "add" for extensive targets (U0, H, G).
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing, global_max_pool
+from torch_geometric.nn import (
+    MessagePassing,
+    global_add_pool,
+    global_mean_pool,
+    global_max_pool,
+)
 from torch_geometric.utils import scatter
 
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
 def _safe_normalize(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return v / (v.norm(dim=-1, keepdim=True) + eps)
 
+
+def _sorted_adjacency(
+    edge_index: torch.Tensor, num_nodes: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Group edges by source node.
+
+    Returns:
+        order:   permutation s.t. edge_index[0, order] is sorted.
+        src_s:   sorted sources (E,).
+        dst_s:   destinations in sorted order (E,).
+        offsets: (num_nodes + 1,) CSR-style offsets into src_s / dst_s.
+    """
+    src, dst = edge_index[0], edge_index[1]
+    order = torch.argsort(src, stable=True)
+    src_s = src[order]
+    dst_s = dst[order]
+    counts = torch.bincount(src_s, minlength=num_nodes)
+    offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+    return order, src_s, dst_s, offsets
+
+
+# ---------------------------------------------------------------------------
+# Invariant geometric edge features
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def compute_bond_angles(
@@ -38,71 +80,45 @@ def compute_bond_angles(
     Mean bond angle at the source node of each edge.
 
     For edge (i -> j), average angle(k - i - j) over all other neighbors k of i.
-    Fully vectorized via scatter_mean over an expanded (edge, neighbor) tensor
-    built from a self-join on i.
-
-    Args:
-        coords: (N, 3) atom positions.
-        edge_index: (2, E) sparse edges.
-
-    Returns:
-        angles: (E,) in radians, 0 where i has no other neighbor.
+    Returns 0 for edges whose source has no other neighbor.
     """
-    src, dst = edge_index[0], edge_index[1]
+    src = edge_index[0]
     E = src.numel()
     if E == 0:
         return coords.new_zeros(0)
 
-    # Group edges by source: sort once, then for each edge in the group
-    # collect all neighbor-ids of the same source.
-    order = torch.argsort(src, stable=True)
-    src_sorted = src[order]
-    dst_sorted = dst[order]
+    N = int(coords.size(0))
+    order, src_s, dst_s, offsets = _sorted_adjacency(edge_index, N)
 
-    # For each source value, the edges in its group are a contiguous slice.
-    # We build pairs (edge_idx, other_neighbor) within each group, excluding
-    # the edge's own destination.
-    counts = torch.bincount(src_sorted, minlength=int(coords.size(0)))
-    # group offsets
-    offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+    counts = offsets[1:] - offsets[:-1]
+    grp_size = counts[src_s]
+    pos_in_grp = torch.arange(E, device=src.device) - offsets[src_s]
 
-    # For each edge e in the sorted order, size of its group:
-    grp_size = counts[src_sorted]                      # (E,)
-    # Position of each edge inside its group:
-    pos_in_grp = torch.arange(E, device=src.device) - offsets[src_sorted]
-
-    # Each edge has (grp_size - 1) companions (other edges sharing the same src).
     companions_per_edge = (grp_size - 1).clamp(min=0)
-    total_pairs = int(companions_per_edge.sum().item())
-    if total_pairs == 0:
-        return coords.new_zeros(E)
+    total_pairs = companions_per_edge.sum()  # 0-dim tensor, no host sync
 
-    # Expansion: each edge repeated `companions_per_edge[e]` times.
     edge_expand = torch.repeat_interleave(
         torch.arange(E, device=src.device), companions_per_edge
     )
-    # Position of each companion slot within its edge's expansion window.
     expand_offsets = companions_per_edge.cumsum(0) - companions_per_edge
     within = torch.arange(total_pairs, device=src.device) - torch.repeat_interleave(
         expand_offsets, companions_per_edge
     )
-    # Partner index inside the group: k if k < pos_in_grp[e] else k+1 (skip self).
+
     skip = within >= pos_in_grp[edge_expand]
     partner_in_grp = within + skip.long()
-    partner_sorted_idx = offsets[src_sorted[edge_expand]] + partner_in_grp
-    partner_dst = dst_sorted[partner_sorted_idx]
+    partner_sorted_idx = offsets[src_s[edge_expand]] + partner_in_grp
+    partner_dst = dst_s[partner_sorted_idx]
 
-    # Vectors for angle at node i = src[edge_expand]
-    i_nodes = src_sorted[edge_expand]
-    j_nodes = dst_sorted[edge_expand]
+    i_nodes = src_s[edge_expand]
+    j_nodes = dst_s[edge_expand]
     k_nodes = partner_dst
 
     v_ij = _safe_normalize(coords[j_nodes] - coords[i_nodes])
     v_ik = _safe_normalize(coords[k_nodes] - coords[i_nodes])
     cos_ang = (v_ij * v_ik).sum(-1).clamp(-1.0, 1.0)
-    ang = torch.acos(cos_ang)                                              # (total_pairs,)
+    ang = torch.acos(cos_ang)
 
-    # Average angle per original sorted edge, then map back to original order.
     mean_ang_sorted = scatter(ang, edge_expand, dim=0, dim_size=E, reduce="mean")
     mean_ang = torch.empty_like(mean_ang_sorted)
     mean_ang[order] = mean_ang_sorted
@@ -113,15 +129,12 @@ def compute_bond_angles(
 def compute_dihedral_angles(
     coords: torch.Tensor,
     edge_index: torch.Tensor,
+    signed: bool = False,
 ) -> torch.Tensor:
     """
-    Dihedral angle for each edge (i -> j) using one neighbor of i and one of j.
-
-    Vectorized: for each edge picks the first other-neighbor of i (call it k)
-    and the first other-neighbor of j (call it l), then computes dihedral of
-    the plane k-i-j versus i-j-l.
-
-    Returns 0 for edges where either i or j has no additional neighbor.
+    Dihedral angle for each edge (i -> j) using one other neighbor k of i
+    and one other neighbor l of j. Returns 0 for edges where either side has
+    no additional neighbor.
     """
     src, dst = edge_index[0], edge_index[1]
     E = src.numel()
@@ -129,55 +142,47 @@ def compute_dihedral_angles(
         return coords.new_zeros(0)
 
     N = int(coords.size(0))
+    _, src_s, dst_s, offsets = _sorted_adjacency(edge_index, N)
+    counts = offsets[1:] - offsets[:-1]
+    dst_s_len = dst_s.numel()
 
-    def _first_other_neighbor(anchor: torch.Tensor, excluded: torch.Tensor) -> torch.Tensor:
-        # For each edge, find any neighbor of `anchor` different from `excluded`.
-        # We use scatter: for each edge give its anchor a candidate; pick min
-        # candidate per (anchor, excluded != dst) group.
-        # Build a mask of edges usable as a neighbor source: where the edge's
-        # src == anchor[e] and dst != excluded[e].
-        # Trick: group edges by their src. For each group, precompute two smallest
-        # dst values so that "first other" can be picked in O(1).
-        src_ = edge_index[0]
-        dst_ = edge_index[1]
-        # Sort edges by src:
-        order = torch.argsort(src_, stable=True)
-        src_s = src_[order]
-        dst_s = dst_[order]
-        counts = torch.bincount(src_s, minlength=N)
-        offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
-
-        # First candidate = dst_s[offsets[anchor]]; second = dst_s[offsets[anchor]+1] if count>1
+    def first_other(anchor: torch.Tensor, excluded: torch.Tensor):
         cnt = counts[anchor]
         idx0 = offsets[anchor]
-        first = dst_s[idx0.clamp(max=dst_s.numel() - 1)]
-        # fallback index when count >= 2
-        idx1 = (idx0 + 1).clamp(max=dst_s.numel() - 1)
-        second = dst_s[idx1]
-
+        idx0_safe = idx0.clamp(max=dst_s_len - 1)
+        idx1_safe = (idx0 + 1).clamp(max=dst_s_len - 1)
+        first = dst_s[idx0_safe]
+        second = dst_s[idx1_safe]
         use_second = (first == excluded) & (cnt >= 2)
         chosen = torch.where(use_second, second, first)
-        # Edges with cnt==0 can't happen (anchor is an endpoint of at least this edge);
-        # Edges with cnt==1 and first==excluded have no other neighbor:
-        has_other = cnt >= 2
+        has_other = (cnt >= 2) | ((cnt >= 1) & (first != excluded))
         return chosen, has_other
 
-    k_node, has_k = _first_other_neighbor(src, dst)
-    l_node, has_l = _first_other_neighbor(dst, src)
+    k_node, has_k = first_other(src, dst)
+    l_node, has_l = first_other(dst, src)
     valid = has_k & has_l
 
-    # Dihedral of (k, i, j, l)
     r_ki = coords[src] - coords[k_node]
     r_ij = coords[dst] - coords[src]
     r_jl = coords[l_node] - coords[dst]
     n1 = torch.cross(r_ki, r_ij, dim=-1)
     n2 = torch.cross(r_ij, r_jl, dim=-1)
-    n1 = _safe_normalize(n1)
-    n2 = _safe_normalize(n2)
-    cos_d = (n1 * n2).sum(-1).clamp(-1.0, 1.0)
-    ang = torch.acos(cos_d)
-    ang = torch.where(valid, ang, torch.zeros_like(ang))
-    return ang
+
+    if signed:
+        n1n = _safe_normalize(n1)
+        n2n = _safe_normalize(n2)
+        r_ij_n = _safe_normalize(r_ij)
+        m1 = torch.cross(n1n, r_ij_n, dim=-1)
+        x = (n1n * n2n).sum(-1)
+        y = (m1 * n2n).sum(-1)
+        ang = torch.atan2(y, x)
+    else:
+        n1n = _safe_normalize(n1)
+        n2n = _safe_normalize(n2)
+        cos_d = (n1n * n2n).sum(-1).clamp(-1.0, 1.0)
+        ang = torch.acos(cos_d)
+
+    return torch.where(valid, ang, torch.zeros_like(ang))
 
 
 def build_invariant_edge_attr(
@@ -185,22 +190,25 @@ def build_invariant_edge_attr(
     coords: torch.Tensor,
     edge_index: torch.Tensor,
     include_dihedral: bool = True,
+    signed_dihedral: bool = False,
 ) -> torch.Tensor:
     """
     Map raw loader edge features [bond_type, theta, phi, distance] to purely
     invariant features [bond_type, distance, bond_angle, (dihedral)].
-
-    theta/phi in the loader are tied to the lab frame and get dropped.
     """
     bond_type = edge_attr_raw[:, 0:1]
     distance = edge_attr_raw[:, 3:4]
     bond_ang = compute_bond_angles(coords, edge_index).unsqueeze(-1)
     feats = [bond_type, distance, bond_ang]
     if include_dihedral:
-        dih = compute_dihedral_angles(coords, edge_index).unsqueeze(-1)
+        dih = compute_dihedral_angles(coords, edge_index, signed=signed_dihedral).unsqueeze(-1)
         feats.append(dih)
     return torch.cat(feats, dim=-1)
 
+
+# ---------------------------------------------------------------------------
+# Message passing
+# ---------------------------------------------------------------------------
 
 class InvariantMP(MessagePassing):
     """Single message-passing step with invariant edge features."""
@@ -229,14 +237,33 @@ class InvariantMP(MessagePassing):
         return self.msg_mlp(torch.cat([x_i, x_j, edge_attr], dim=-1))
 
 
+# ---------------------------------------------------------------------------
+# Full model
+# ---------------------------------------------------------------------------
+
+_POOLINGS = {
+    "add": global_add_pool,
+    "mean": global_mean_pool,
+    "max": global_max_pool,
+}
+
+
 class InvariantGNN(nn.Module):
     """
-    Invariant message-passing GNN.
+    Invariant message-passing GNN for QM9 HOMO-LUMO gap regression.
 
-    Consumes loader-native tensors: x = (N, node_dim), edge_index = (2, E),
-    edge_attr = (E, 4) raw from the loader. Invariant edge features are
-    computed internally (once per forward).
+    Predicts in physical units (eV). Internally the network regresses on a
+    standardized target; mean/std are stored as buffers and applied in
+    `forward` to return original-scale predictions.
+
+    Workflow:
+        model = InvariantGNN(...)
+        model.fit_target_stats(train_loader, target_index=4)  # 4 = gap in PyG QM9
+        # ... train with MSE between model(...) and batch.y[:, 4] ...
     """
+
+    # PyG's QM9 target layout: 4 = HOMO-LUMO gap (eV).
+    DEFAULT_TARGET_INDEX = 4
 
     def __init__(
         self,
@@ -244,13 +271,19 @@ class InvariantGNN(nn.Module):
         hidden_dim: int = 64,
         num_layers: int = 6,
         include_dihedral: bool = True,
+        signed_dihedral: bool = False,
         coord_cols: slice = slice(4, 7),
         out_dim: int = 1,
+        pooling: str = "mean",  # intensive target -> mean
     ):
         super().__init__()
+        if pooling not in _POOLINGS:
+            raise ValueError(f"pooling must be one of {list(_POOLINGS)}; got {pooling!r}")
         self.coord_cols = coord_cols
         self.include_dihedral = include_dihedral
+        self.signed_dihedral = signed_dihedral
         self.edge_dim = 4 if include_dihedral else 3
+        self._pool = _POOLINGS[pooling]
 
         self.node_embed = nn.Linear(node_dim, hidden_dim)
         self.edge_embed = nn.Sequential(
@@ -267,6 +300,82 @@ class InvariantGNN(nn.Module):
             nn.Linear(32, out_dim),
         )
 
+        # Target standardization buffers. Default (0, 1) == identity so the
+        # model works (without standardization benefit) even if
+        # fit_target_stats hasn't been called yet.
+        self.register_buffer("target_mean", torch.zeros(1))
+        self.register_buffer("target_std", torch.ones(1))
+        self.register_buffer("_stats_fitted", torch.tensor(False))
+
+    # ------------------------------------------------------------------
+    # Target standardization
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def fit_target_stats(
+        self,
+        loader: Iterable,
+        target_index: Optional[int] = None,
+    ) -> Tuple[float, float]:
+        """
+        Compute mean/std of the target on the given loader. This MUST be the
+        training split only -- using val/test leaks information.
+
+        Uses a numerically stable streaming (Welford) update so arbitrarily
+        large datasets work without loading everything into memory at once.
+
+        `target_index` selects the column of batch.y; defaults to the
+        HOMO-LUMO gap (index 4 in PyG's QM9).
+
+        Returns (mean, std) as Python floats.
+        """
+        if target_index is None:
+            target_index = self.DEFAULT_TARGET_INDEX
+
+        count = 0
+        mean = 0.0
+        m2 = 0.0  # sum of squared deviations from current mean
+
+        for batch in loader:
+            y = batch.y
+            if y.dim() > 1:
+                y = y[:, target_index]
+            y = y.flatten().double()
+            n_b = y.numel()
+            if n_b == 0:
+                continue
+            mean_b = y.mean().item()
+            m2_b = ((y - mean_b) ** 2).sum().item()
+            delta = mean_b - mean
+            new_count = count + n_b
+            mean = mean + delta * n_b / new_count
+            m2 = m2 + m2_b + delta ** 2 * count * n_b / new_count
+            count = new_count
+
+        if count < 2:
+            raise RuntimeError(
+                f"fit_target_stats needs at least 2 samples; got {count}."
+            )
+
+        std = (m2 / (count - 1)) ** 0.5
+        if std < 1e-8:
+            raise RuntimeError(
+                f"Target std is ~0 ({std:.2e}); check that target_index={target_index} "
+                f"selects the right column."
+            )
+
+        device = self.target_mean.device
+        self.target_mean.copy_(torch.tensor([mean], device=device))
+        self.target_std.copy_(torch.tensor([std], device=device))
+        self._stats_fitted.copy_(torch.tensor(True))
+        return float(mean), float(std)
+
+    @property
+    def stats_fitted(self) -> bool:
+        return bool(self._stats_fitted.item())
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(
         self,
         x: torch.Tensor,
@@ -276,11 +385,19 @@ class InvariantGNN(nn.Module):
     ) -> torch.Tensor:
         coords = x[:, self.coord_cols]
         inv_attr = build_invariant_edge_attr(
-            edge_attr, coords, edge_index, self.include_dihedral
+            edge_attr, coords, edge_index,
+            include_dihedral=self.include_dihedral,
+            signed_dihedral=self.signed_dihedral,
         )
         h = self.node_embed(x)
         e = self.edge_embed(inv_attr)
         for layer in self.layers:
             h = layer(h, edge_index, e)
-        g = global_max_pool(h, batch) if batch is not None else h.max(0, keepdim=True)[0]
-        return self.readout(g).squeeze(-1)
+        if batch is None:
+            batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
+        g = self._pool(h, batch)
+        z = self.readout(g).squeeze(-1)  # standardized-space prediction
+
+        # Denormalize to physical units (eV). If stats weren't fit, the
+        # buffers are (0, 1) and this is a no-op.
+        return z * self.target_std + self.target_mean

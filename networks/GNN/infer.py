@@ -17,7 +17,7 @@ from loguru import logger
 
 from configs.configuration import Config
 from data_handlers.qm9_graph_loader import build_loaders_from_config
-from networks.GNN.train import _build_model, _forward
+from networks.GNN.train import _build_model, _forward, _denormalize_targets, _load_target_stats
 
 
 def main():
@@ -40,13 +40,21 @@ def main():
     model.eval()
     logger.info(f"Loaded weights from {args.weights}")
 
+    stats_path = pathlib.Path(args.weights).with_name("target_stats.pt")
+    target_stats = _load_target_stats(stats_path)
+    if target_stats is None:
+        logger.warning(f"Target stats not found at {stats_path}; using raw outputs")
+
     preds, trues = [], []
     with torch.no_grad():
         for batch in test_loader:
             batch = batch.to(device, non_blocking=True)
-            p = _forward(model, batch, config.model.type).view(-1).cpu().numpy()
-            preds.append(p)
-            trues.append(batch.y.view(-1).cpu().numpy())
+            p = _forward(model, batch, config.model.type).view(-1)
+            y = batch.y.view(-1)
+            if target_stats is not None:
+                p = _denormalize_targets(p, target_stats)
+            preds.append(p.cpu().numpy())
+            trues.append(y.cpu().numpy())
 
     preds = np.concatenate(preds)
     trues = np.concatenate(trues)

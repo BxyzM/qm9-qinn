@@ -127,7 +127,15 @@ class QM9GraphDataset(Dataset):
         # Slice only the heavy-atom block; dense zeros beyond are padding.
         nodes = self._h5["node_features"][idx, :n_heavy]                     # (H, 9)
         edges = self._h5["edge_features"][idx, :n_heavy, :n_heavy]           # (H, H, 4)
-        target = self._h5["targets"][idx][self.target_indices]
+        raw_target = np.asarray(self._h5["targets"][idx])
+        if raw_target.ndim == 0:
+            if len(self.target_indices) != 1:
+                raise ValueError(
+                    "Scalar targets found in HDF5, but multiple target keys were requested."
+                )
+            target = raw_target.reshape(1)
+        else:
+            target = raw_target[self.target_indices]
 
         nodes_t = torch.from_numpy(np.asarray(nodes, dtype=np.float32))
         edges_t = torch.from_numpy(np.asarray(edges, dtype=np.float32))

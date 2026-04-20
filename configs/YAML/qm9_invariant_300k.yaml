@@ -1,0 +1,37 @@
+setup:
+  run_id: "gnn_inv"
+  train: true
+  batch_size: 256
+  epochs: 50
+  shuffle: true
+  num_workers: 1
+  targets:
+    - "gap"
+  seed: 42
+  train_n: null
+  val_n: null
+  test_n: null
+
+model:
+  type: "gnn_invariant"
+  node_dim: 9
+  hidden_dim: 128
+  num_layers: 6
+  include_dihedral: true
+  pooling: "mean"
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-3
+  decay_factor: 0.5
+  decay_patience: 5
+  decay_threshold: 1.0e-3
+
+loss:
+  name: "mae"
+
+paths:
+  train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_invariant"
