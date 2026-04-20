@@ -1,4 +1,4 @@
-# qm9-gnn — Classical GNNs for QM9 Property Prediction
+# qm9-qinn — Classical (QFIM-informed) GNNs for QM9 Property Prediction
 
 Classical graph neural networks for molecular property regression on the [QM9](https://www.nature.com/articles/sdata201422) dataset. Split out from the bioQINN project; this repository contains only the classical (and QFIM-informed classical) components.
 
@@ -9,7 +9,7 @@ Primary regression target: **HOMO-LUMO gap** (Δε between HOMO and LUMO).
 ## Repository Structure
 
 ```
-qm9-gnn/
+qm9-qinn/
 ├── configs/
 │   ├── YAML/
 │   │   ├── qm9.yaml            # Example run config
