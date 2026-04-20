@@ -17,3 +17,5 @@ wandb/
 .vscode/
 .idea/
 .DS_Store
+
+CLAUDE.md
