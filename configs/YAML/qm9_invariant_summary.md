@@ -6,7 +6,7 @@ This config runs the invariant QM9 GNN with dihedral features enabled.
 
 - Model type: `gnn_invariant`
 - Node feature dim: `9`
-- Hidden dim: `128`
+- Hidden dim: `256`
 - Message-passing layers: `6`
 - Dihedral: `on`
 - Target: `gap`
@@ -15,16 +15,16 @@ This config runs the invariant QM9 GNN with dihedral features enabled.
 
 The model is built from four trainable parts:
 
-1. `node_embed`: `Linear(9, 128)`
-2. `edge_embed`: `Linear(4, 128) -> ReLU -> Linear(128, 128)`
+1. `node_embed`: `Linear(9, 256)`
+2. `edge_embed`: `Linear(4, 256) -> ReLU -> Linear(256, 256)`
 3. `6 x InvariantMP` blocks, each with:
-   - `Linear(213, 128)` for the message MLP input `[x_i, x_j, edge_attr]`
-   - `LayerNorm(128)`
-4. `readout`: `Linear(128, 32) -> ReLU -> Linear(32, 1)`
+   - `Linear(516, 256)` for the message MLP input `[x_i, x_j, edge_attr]`
+   - `LayerNorm(256)`
+4. `readout`: `Linear(256, 32) -> ReLU -> Linear(32, 1)`
 
 ## Approximate Trainable Parameters
 
-With `hidden_dim=128`, the model has about `319,809` trainable parameters.
+With `hidden_dim=256`, the model has about `875,073` trainable parameters.
 
 ## How to Run
 

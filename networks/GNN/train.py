@@ -26,59 +26,6 @@ from data_handlers.qm9_graph_loader import build_loaders_from_config
 from networks.GNN import GNN, InvariantGNN, QFIMGNN
 
 
-def _collect_target_stats(loader) -> dict:
-    total = None
-    total_sq = None
-    count = 0
-
-    for batch in loader:
-        y = batch.y.view(batch.y.size(0), -1).double()
-        batch_sum = y.sum(dim=0)
-        batch_sum_sq = (y * y).sum(dim=0)
-
-        if total is None:
-            total = batch_sum
-            total_sq = batch_sum_sq
-        else:
-            total = total + batch_sum
-            total_sq = total_sq + batch_sum_sq
-        count += y.size(0)
-
-    if count == 0:
-        raise ValueError("Cannot compute target statistics from an empty loader")
-
-    mean = total / count
-    var = (total_sq / count) - mean * mean
-    std = torch.sqrt(torch.clamp(var, min=0.0)).clamp_min(1e-8)
-    return {"mean": mean.float(), "std": std.float()}
-
-
-def _normalize_targets(targets: torch.Tensor, stats: dict) -> torch.Tensor:
-    mean = stats["mean"].to(targets.device)
-    std = stats["std"].to(targets.device)
-    return (targets - mean) / std
-
-
-def _denormalize_targets(targets: torch.Tensor, stats: dict) -> torch.Tensor:
-    mean = stats["mean"].to(targets.device)
-    std = stats["std"].to(targets.device)
-    return targets * std + mean
-
-
-def _save_target_stats(stats: dict, path: pathlib.Path) -> None:
-    payload = {key: value.detach().cpu() for key, value in stats.items()}
-    torch.save(payload, path)
-
-
-def _load_target_stats(path: pathlib.Path) -> dict | None:
-    if not path.exists():
-        return None
-    payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict) or "mean" not in payload or "std" not in payload:
-        raise ValueError(f"Invalid target stats file: {path}")
-    return {"mean": payload["mean"].float(), "std": payload["std"].float()}
-
-
 def _build_model(config) -> nn.Module:
     mt = config.model.type
     node_dim = int(getattr(config.model, "node_dim", 9))
@@ -112,6 +59,7 @@ def _build_model(config) -> nn.Module:
             hidden_dim=hidden,
             num_layers=layers,
             include_dihedral=include_dihedral,
+            pooling=pooling or "mean",
         )
     raise ValueError(f"Unknown model.type={mt!r}")
 
@@ -133,7 +81,6 @@ def _run_epoch(
     optimizer,
     device: torch.device,
     model_type: str,
-    target_stats: dict,
     train: bool,
     desc: str = "",
 ) -> Tuple[float, float]:
@@ -146,11 +93,9 @@ def _run_epoch(
         batch = batch.to(device, non_blocking=True)
         y = batch.y.view(-1)
         with torch.set_grad_enabled(train):
-            pred_norm = _forward(model, batch, model_type).view(-1)
-            y_norm = _normalize_targets(y, target_stats).view(-1)
-            loss = loss_fn(pred_norm, y_norm)
-            pred = _denormalize_targets(pred_norm.detach(), target_stats)
-            mae = (pred - y).abs().mean()
+            pred = _forward(model, batch, model_type).view(-1)
+            loss = loss_fn(pred, y)
+            mae = (pred.detach() - y).abs().mean()
         if train:
             optimizer.zero_grad()
             loss.backward()
@@ -178,11 +123,20 @@ def main():
         f"val_batches={len(val_loader)} batch_size={config.setup.batch_size} "
         f"num_workers={getattr(config.setup, 'num_workers', 0)}"
     )
-    target_stats = _collect_target_stats(train_loader)
     model = _build_model(config).to(device)
     logger.info(
         f"Model {config.model.type} | params={sum(p.numel() for p in model.parameters()):,}"
     )
+
+    # Fit target standardization stats on the training split only. For
+    # InvariantGNN these live as buffers that travel with state_dict so
+    # checkpoints / infer runs don't need a separate stats file. For other
+    # models fit_target_stats is a no-op.
+    if hasattr(model, "fit_target_stats"):
+        mean, std = model.fit_target_stats(train_loader)
+        logger.info("=" * 72)
+        logger.info(f"target normalization | mean={mean:.6f} | std={std:.6f}")
+        logger.info("=" * 72)
 
     loss_name = getattr(config.loss, "name", "huber")
     if loss_name == "mse":
@@ -204,14 +158,6 @@ def main():
     model_dir = pathlib.Path(config.paths.model_dir) / config.setup.run_id
     model_dir.mkdir(parents=True, exist_ok=True)
     config.save(str(model_dir / "config.yaml"))
-    _save_target_stats(target_stats, model_dir / "target_stats.pt")
-    logger.info("=" * 72)
-    logger.info(
-        "target normalization | mean={} | std={}",
-        target_stats["mean"].tolist(),
-        target_stats["std"].tolist(),
-    )
-    logger.info("=" * 72)
 
     stats_path = model_dir / "epoch_stats.csv"
     with stats_path.open("w", newline="") as stats_file:
@@ -233,12 +179,10 @@ def main():
             t0 = time.time()
             train_loss, train_mae = _run_epoch(
                 model, train_loader, loss_fn, opt, device, config.model.type,
-                target_stats,
                 train=True, desc=f"train {epoch:03d}",
             )
             val_loss, val_mae = _run_epoch(
                 model, val_loader, loss_fn, opt, device, config.model.type,
-                target_stats,
                 train=False, desc=f"val   {epoch:03d}",
             )
             scheduler.step(val_loss)

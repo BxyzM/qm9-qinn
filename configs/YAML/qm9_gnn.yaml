@@ -15,9 +15,10 @@ setup:
 model:
   type: "gnn_qfim"        # one of: gnn, gnn_invariant, gnn_qfim
   node_dim: 9
-  hidden_dim: 32
+  hidden_dim: 128
   num_layers: 6
   include_dihedral: true
+  pooling: "mean"
 
 # QFIM block.
 # - In-file qfim: the HDF5 files at paths.* already contain an (N, 101, 101)
@@ -40,8 +41,7 @@ optimizer:
   decay_threshold: 1.0e-3
 
 loss:
-  name: "huber"
-  delta: 0.1
+  name: "mae"
 
 paths:
   train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"

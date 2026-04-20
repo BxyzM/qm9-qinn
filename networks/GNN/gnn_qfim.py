@@ -24,9 +24,16 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import MessagePassing, global_max_pool
+from torch_geometric.nn import MessagePassing, global_add_pool, global_mean_pool, global_max_pool
 
 from .gnn_invariant import build_invariant_edge_attr
+
+
+_POOLINGS = {
+    "add": global_add_pool,
+    "mean": global_mean_pool,
+    "max": global_max_pool,
+}
 
 
 class QFIMEdgeConv(MessagePassing):
@@ -102,15 +109,19 @@ class QFIMGNN(nn.Module):
         hidden_dim: int = 32,
         num_layers: int = 6,
         include_dihedral: bool = True,
+        pooling: str = "max",
         coord_cols: slice = slice(4, 7),
         out_dim: int = 1,
     ):
         super().__init__()
+        if pooling not in _POOLINGS:
+            raise ValueError(f"pooling must be one of {list(_POOLINGS)}; got {pooling!r}")
         self.coord_cols = coord_cols
         self.include_dihedral = include_dihedral
         self.geom_edge_dim = 4 if include_dihedral else 3
         self.qfim_edge_dim = qfim_per_qubit_dim * qfim_per_qubit_dim
         self.edge_in_dim = self.geom_edge_dim + self.qfim_edge_dim
+        self._pool = _POOLINGS[pooling]
 
         self.node_embed = nn.Linear(node_dim, hidden_dim)
         self.edge_embed = nn.Sequential(
@@ -150,5 +161,7 @@ class QFIMGNN(nn.Module):
         e = self.edge_embed(e_in)
         for layer in self.layers:
             h = layer(h, edge_index, e)
-        g = global_max_pool(h, batch) if batch is not None else h.max(0, keepdim=True)[0]
+        if batch is None:
+            batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
+        g = self._pool(h, batch)
         return self.readout(g).squeeze(-1)

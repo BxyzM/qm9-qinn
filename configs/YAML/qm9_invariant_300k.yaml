@@ -1,7 +1,7 @@
 setup:
   run_id: "gnn_inv"
   train: true
-  batch_size: 256
+  batch_size: 128
   epochs: 50
   shuffle: true
   num_workers: 1
@@ -15,17 +15,17 @@ setup:
 model:
   type: "gnn_invariant"
   node_dim: 9
-  hidden_dim: 128
+  hidden_dim: 256
   num_layers: 6
   include_dihedral: true
   pooling: "mean"
 
 optimizer:
   name: "adam"
-  lr: 1.0e-3
+  lr: 5.0e-4
   decay_factor: 0.5
   decay_patience: 5
-  decay_threshold: 1.0e-3
+  decay_threshold: 1.0e-4
 
 loss:
   name: "mae"
