@@ -13,8 +13,7 @@ Rotation/translation invariance:
 
 Target standardization:
 - The model stores (target_mean, target_std) as buffers.
-- Internally the MLP regresses on a standardized target; `forward` denormalizes
-  so callers always work in physical units (eV).
+- Internally the MLP regresses on a standardized target; `forward` denormalizes so callers always work in physical units (eV).
 - Fit statistics on the training split only: `model.fit_target_stats(loader)`
   once before training. Stats save with state_dict so checkpoints / eval runs
   don't drift.
@@ -129,60 +128,100 @@ def compute_bond_angles(
 def compute_dihedral_angles(
     coords: torch.Tensor,
     edge_index: torch.Tensor,
-    signed: bool = False,
 ) -> torch.Tensor:
     """
-    Dihedral angle for each edge (i -> j) using one other neighbor k of i
-    and one other neighbor l of j. Returns 0 for edges where either side has
-    no additional neighbor.
+    Mean unsigned dihedral at each edge (i -> j), averaged over all valid
+    4-atom chains k - i - j - l where:
+        * k is a bonded neighbor of i, k != j
+        * l is a bonded neighbor of j, l != i
+        * k != l  (else k, i, j, l are coplanar -- 3-ring degeneracy)
+
+    Returns 0 for edges with no valid (k, l) pair (terminal bonds, or the
+    only other neighbor on each side collapses to the same atom).
+
+    Unsigned (O(3)-invariant) is correct for QM9 scalar targets like the
+    HOMO-LUMO gap, which are identical for a molecule and its mirror image.
+    A signed dihedral would break that reflection symmetry and let the model
+    learn a spurious dependence on handedness.
+
+    Averaging over all (k, l) pairs (not just the "first" pair each side)
+    makes the feature independent of the neighbor storage order and uses all
+    the local geometry the bonds provide.
     """
-    src, dst = edge_index[0], edge_index[1]
+    src = edge_index[0]
     E = src.numel()
     if E == 0:
         return coords.new_zeros(0)
 
     N = int(coords.size(0))
-    _, src_s, dst_s, offsets = _sorted_adjacency(edge_index, N)
+    order, src_s, dst_s, offsets = _sorted_adjacency(edge_index, N)
     counts = offsets[1:] - offsets[:-1]
-    dst_s_len = dst_s.numel()
+    dev = src.device
 
-    def first_other(anchor: torch.Tensor, excluded: torch.Tensor):
-        cnt = counts[anchor]
-        idx0 = offsets[anchor]
-        idx0_safe = idx0.clamp(max=dst_s_len - 1)
-        idx1_safe = (idx0 + 1).clamp(max=dst_s_len - 1)
-        first = dst_s[idx0_safe]
-        second = dst_s[idx1_safe]
-        use_second = (first == excluded) & (cnt >= 2)
-        chosen = torch.where(use_second, second, first)
-        has_other = (cnt >= 2) | ((cnt >= 1) & (first != excluded))
-        return chosen, has_other
+    # Enumerate every (edge, k) pair where k in neighbors(i) \ {j}. Same
+    # expansion as compute_bond_angles: for each sorted edge e=(i,j), we want
+    # all of i's neighbors except the slot occupied by j itself.
+    grp_i = counts[src_s]                                       # |N(i)|
+    pos_j_in_Ni = torch.arange(E, device=dev) - offsets[src_s]  # slot of j inside N(i)
+    num_k = (grp_i - 1).clamp(min=0)                            # |N(i)| - 1
+    if num_k.sum() == 0:
+        return coords.new_zeros(E)
 
-    k_node, has_k = first_other(src, dst)
-    l_node, has_l = first_other(dst, src)
-    valid = has_k & has_l
+    pk = num_k.sum().item()
+    edge_of_pair = torch.repeat_interleave(torch.arange(E, device=dev), num_k)
+    base_k = torch.repeat_interleave(num_k.cumsum(0) - num_k, num_k)
+    within_k = torch.arange(pk, device=dev) - base_k
+    slot_k = within_k + (within_k >= pos_j_in_Ni[edge_of_pair]).long()
+    k_nodes = dst_s[offsets[src_s[edge_of_pair]] + slot_k]
 
-    r_ki = coords[src] - coords[k_node]
-    r_ij = coords[dst] - coords[src]
-    r_jl = coords[l_node] - coords[dst]
-    n1 = torch.cross(r_ki, r_ij, dim=-1)
-    n2 = torch.cross(r_ij, r_jl, dim=-1)
+    i_of_pair = src_s[edge_of_pair]
+    j_of_pair = dst_s[offsets[src_s[edge_of_pair]] + pos_j_in_Ni[edge_of_pair]]
 
-    if signed:
-        n1n = _safe_normalize(n1)
-        n2n = _safe_normalize(n2)
-        r_ij_n = _safe_normalize(r_ij)
-        m1 = torch.cross(n1n, r_ij_n, dim=-1)
-        x = (n1n * n2n).sum(-1)
-        y = (m1 * n2n).sum(-1)
-        ang = torch.atan2(y, x)
-    else:
-        n1n = _safe_normalize(n1)
-        n2n = _safe_normalize(n2)
-        cos_d = (n1n * n2n).sum(-1).clamp(-1.0, 1.0)
-        ang = torch.acos(cos_d)
+    # Enumerate every (edge, k, l) triple where l in neighbors(j). We emit
+    # all |N(j)| slots per (edge, k) and then mask out l==i and l==k. We don't
+    # try to encode the "skip i" trick here because neighbors(j) aren't sorted
+    # by destination value -- simpler to mask.
+    grp_j = counts[j_of_pair]                                   # |N(j)|
+    if grp_j.sum() == 0:
+        return coords.new_zeros(E)
 
-    return torch.where(valid, ang, torch.zeros_like(ang))
+    pl = grp_j.sum().item()
+    pair_idx = torch.repeat_interleave(torch.arange(pk, device=dev), grp_j)
+    base_l = torch.repeat_interleave(grp_j.cumsum(0) - grp_j, grp_j)
+    slot_l = torch.arange(pl, device=dev) - base_l
+    l_nodes = dst_s[offsets[j_of_pair[pair_idx]] + slot_l]
+
+    # Lift per-pair fields to per-triple, then filter.
+    edge_q = edge_of_pair[pair_idx]
+    i_q = i_of_pair[pair_idx]
+    j_q = j_of_pair[pair_idx]
+    k_q = k_nodes[pair_idx]
+    l_q = l_nodes
+
+    # Drop l == i (going back along the bond) and l == k (3-ring: k,i,j,l coplanar).
+    keep = (l_q != i_q) & (l_q != k_q)
+    edge_q = edge_q[keep]; i_q = i_q[keep]; j_q = j_q[keep]
+    k_q = k_q[keep];       l_q = l_q[keep]
+
+    if edge_q.numel() == 0:
+        return coords.new_zeros(E)
+
+    # Dihedral geometry: angle between normals of planes (k,i,j) and (i,j,l).
+    r_ki = coords[i_q] - coords[k_q]
+    r_ij = coords[j_q] - coords[i_q]
+    r_jl = coords[l_q] - coords[j_q]
+    n1 = _safe_normalize(torch.cross(r_ki, r_ij, dim=-1))
+    n2 = _safe_normalize(torch.cross(r_ij, r_jl, dim=-1))
+    cos_d = (n1 * n2).sum(-1).clamp(-1.0, 1.0)
+    ang = torch.acos(cos_d)
+
+    # Mean per sorted edge, then undo the sort back to original edge order.
+    # scatter(reduce="mean") of an empty group returns 0 -- exactly what we
+    # want for edges with no valid (k, l) triple.
+    mean_ang_sorted = scatter(ang, edge_q, dim=0, dim_size=E, reduce="mean")
+    mean_ang = torch.empty_like(mean_ang_sorted)
+    mean_ang[order] = mean_ang_sorted
+    return mean_ang
 
 
 def build_invariant_edge_attr(
@@ -190,9 +229,8 @@ def build_invariant_edge_attr(
     coords: torch.Tensor,
     edge_index: torch.Tensor,
     include_dihedral: bool = True,
-    signed_dihedral: bool = False,
 ) -> torch.Tensor:
-    """
+    """m
     Map raw loader edge features [bond_type, theta, phi, distance] to purely
     invariant features [bond_type, distance, bond_angle, (dihedral)].
     """
@@ -201,7 +239,7 @@ def build_invariant_edge_attr(
     bond_ang = compute_bond_angles(coords, edge_index).unsqueeze(-1)
     feats = [bond_type, distance, bond_ang]
     if include_dihedral:
-        dih = compute_dihedral_angles(coords, edge_index, signed=signed_dihedral).unsqueeze(-1)
+        dih = compute_dihedral_angles(coords, edge_index).unsqueeze(-1)
         feats.append(dih)
     return torch.cat(feats, dim=-1)
 
@@ -258,8 +296,9 @@ class InvariantGNN(nn.Module):
 
     Workflow:
         model = InvariantGNN(...)
-        model.fit_target_stats(train_loader, target_index=4)  # 4 = gap in PyG QM9
-        # ... train with MSE between model(...) and batch.y[:, 4] ...
+        model.fit_target_stats(train_loader)  # once, on train split only
+        # ... train with loss_fn(model(...), batch.y) in eV ...
+        # (Huber/MAE/MSE -- see train.py; both pred and y are in eV.)
     """
 
     # PyG's QM9 target layout: 4 = HOMO-LUMO gap (eV).
@@ -271,8 +310,7 @@ class InvariantGNN(nn.Module):
         hidden_dim: int = 64,
         num_layers: int = 6,
         include_dihedral: bool = True,
-        signed_dihedral: bool = False,
-        coord_cols: slice = slice(4, 7),
+        coord_cols: slice = slice(4, 7), # -> x,y,z
         out_dim: int = 1,
         pooling: str = "mean",  # intensive target -> mean
     ):
@@ -281,7 +319,6 @@ class InvariantGNN(nn.Module):
             raise ValueError(f"pooling must be one of {list(_POOLINGS)}; got {pooling!r}")
         self.coord_cols = coord_cols
         self.include_dihedral = include_dihedral
-        self.signed_dihedral = signed_dihedral
         self.edge_dim = 4 if include_dihedral else 3
         self._pool = _POOLINGS[pooling]
 
@@ -406,7 +443,6 @@ class InvariantGNN(nn.Module):
         inv_attr = build_invariant_edge_attr(
             edge_attr, coords, edge_index,
             include_dihedral=self.include_dihedral,
-            signed_dihedral=self.signed_dihedral,
         )
         h = self.node_embed(x)
         e = self.edge_embed(inv_attr)

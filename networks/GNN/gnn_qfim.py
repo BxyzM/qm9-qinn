@@ -92,7 +92,6 @@ class QFIMGNN(nn.Module):
         hidden_dim: int = 64,
         num_layers: int = 6,
         include_dihedral: bool = True,
-        signed_dihedral: bool = False,
         coord_cols: slice = slice(4, 7),
         out_dim: int = 1,
         pooling: str = "mean",             # intensive target -> mean
@@ -102,7 +101,6 @@ class QFIMGNN(nn.Module):
             raise ValueError(f"pooling must be one of {list(_POOLINGS)}; got {pooling!r}")
         self.coord_cols = coord_cols
         self.include_dihedral = include_dihedral
-        self.signed_dihedral = signed_dihedral
         self.geom_edge_dim = 4 if include_dihedral else 3
         self.qfim_edge_dim = qfim_per_qubit_dim * qfim_per_qubit_dim
         self.edge_in_dim = self.geom_edge_dim + self.qfim_edge_dim
@@ -194,7 +192,6 @@ class QFIMGNN(nn.Module):
         geom_attr = build_invariant_edge_attr(
             edge_attr, coords, edge_index,
             include_dihedral=self.include_dihedral,
-            signed_dihedral=self.signed_dihedral,
         )
         if batch is None:
             batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
