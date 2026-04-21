@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_inv_huber"
+  run_id: "gnn_qfim_huber"
   train: true
   batch_size: 128
   epochs: 100
@@ -14,12 +14,16 @@ setup:
   save_every_epoch: true
 
 model:
-  type: "gnn_invariant"
+  type: "gnn_qfim"
   node_dim: 9
   hidden_dim: 128
   num_layers: 6
   include_dihedral: true
   pooling: "mean"
+
+qfim:
+  n_qubits: 10
+  per_qubit_dim: 6             # num_layers (2) * operations_per_layer (3)
 
 optimizer:
   name: "adam"
@@ -36,4 +40,4 @@ paths:
   train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
   val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
   test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
-  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_invariant"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim"

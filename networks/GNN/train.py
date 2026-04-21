@@ -175,6 +175,7 @@ def main():
 
         best_val = float("inf")
         epochs = int(config.setup.epochs)
+        save_every_epoch = bool(getattr(config.setup, "save_every_epoch", False))
         for epoch in range(1, epochs + 1):
             t0 = time.time()
             train_loss, train_mae = _run_epoch(
@@ -196,6 +197,10 @@ def main():
                 f"lr={current_lr:.2e} | {dt:.1f}s"
             )
             torch.save(model.state_dict(), model_dir / "last.pt")
+            if save_every_epoch:
+                epoch_dir = model_dir / "epochs"
+                epoch_dir.mkdir(exist_ok=True)
+                torch.save(model.state_dict(), epoch_dir / f"epoch_{epoch:03d}.pt")
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save(model.state_dict(), model_dir / "best.pt")

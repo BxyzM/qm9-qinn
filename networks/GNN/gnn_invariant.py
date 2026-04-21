@@ -331,9 +331,17 @@ class InvariantGNN(nn.Module):
         if target_index is None:
             target_index = self.DEFAULT_TARGET_INDEX
 
+        # Chan/Welford parallel variance: merges per-batch (count, mean, M2)
+        # into a running (count, mean, M2) that is mathematically identical to
+        # computing mean/var over the concatenated dataset, in O(1) memory.
+        # NOT per-batch standardization -- the final `mean`, `std` are global
+        # over the whole loader. Used instead of torch.cat(all_y).std() so this
+        # scales to arbitrarily large HDF5 splits without loading every label.
+        # Reference: Chan, Golub, LeVeque (1979), "Updating Formulae and a
+        # Pairwise Algorithm for Computing Sample Variances."
         count = 0
         mean = 0.0
-        m2 = 0.0  # sum of squared deviations from current mean
+        m2 = 0.0  # running sum of squared deviations from the running mean
 
         for batch in loader:
             y = batch.y
@@ -345,6 +353,7 @@ class InvariantGNN(nn.Module):
                 continue
             mean_b = y.mean().item()
             m2_b = ((y - mean_b) ** 2).sum().item()
+            # Merge (count, mean, m2) <- (count, mean, m2) U (n_b, mean_b, m2_b).
             delta = mean_b - mean
             new_count = count + n_b
             mean = mean + delta * n_b / new_count
