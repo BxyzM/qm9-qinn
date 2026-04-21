@@ -300,9 +300,12 @@ class InvariantGNN(nn.Module):
             nn.Linear(32, out_dim),
         )
 
-        # Target standardization buffers. Default (0, 1) == identity so the
-        # model works (without standardization benefit) even if
-        # fit_target_stats hasn't been called yet.
+        # Target standardization buffers. Start at identity (0, 1) and get
+        # overwritten by fit_target_stats. The _stats_fitted flag is checked
+        # in forward so the model refuses to predict before stats are fit --
+        # silent use of the identity would produce wrong-scale outputs.
+        # All three are buffers: they travel with state_dict, so a loaded
+        # checkpoint carries the train-split stats (and "fitted" bit) with it.
         self.register_buffer("target_mean", torch.zeros(1))
         self.register_buffer("target_std", torch.ones(1))
         self.register_buffer("_stats_fitted", torch.tensor(False))
@@ -378,9 +381,6 @@ class InvariantGNN(nn.Module):
         self._stats_fitted.copy_(torch.tensor(True))
         return float(mean), float(std)
 
-    @property
-    def stats_fitted(self) -> bool:
-        return bool(self._stats_fitted.item())
 
     # ------------------------------------------------------------------
     # Forward
@@ -392,6 +392,16 @@ class InvariantGNN(nn.Module):
         edge_attr: torch.Tensor,
         batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Guard against using the model before train-split stats were fit
+        # (or after loading a checkpoint saved before fit_target_stats ran).
+        # Without this, the (0, 1) identity buffers would silently produce
+        # predictions on the wrong scale.
+        if not bool(self._stats_fitted.item()):
+            raise RuntimeError(
+                "InvariantGNN.forward called before fit_target_stats. "
+                "Call model.fit_target_stats(train_loader) once before "
+                "training / evaluation, or load a checkpoint saved after it."
+            )
         coords = x[:, self.coord_cols]
         inv_attr = build_invariant_edge_attr(
             edge_attr, coords, edge_index,
@@ -407,6 +417,6 @@ class InvariantGNN(nn.Module):
         g = self._pool(h, batch)
         z = self.readout(g).squeeze(-1)  # standardized-space prediction
 
-        # Denormalize to physical units (eV). If stats weren't fit, the
-        # buffers are (0, 1) and this is a no-op.
+        # Denormalize to physical units (eV). The guard at the top of forward
+        # ensures target_mean/target_std hold fitted train-split values.
         return z * self.target_std + self.target_mean
