@@ -1,7 +1,7 @@
 setup:
   run_id: "gnn_inv_huber"
   train: true
-  batch_size: 128
+  batch_size: 256
   epochs: 100
   shuffle: true
   num_workers: 1

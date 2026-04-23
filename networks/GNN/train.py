@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from configs.configuration import Config
 from data_handlers.qm9_graph_loader import build_loaders_from_config
-from networks.GNN import GNN, InvariantGNN, QFIMGNN
+from networks.GNN import GNN, InvariantGNN, QFIMGNN, QFIMGNNStructured, QFIMGNNConv
 
 
 def _build_model(config) -> nn.Module:
@@ -61,11 +61,38 @@ def _build_model(config) -> nn.Module:
             include_dihedral=include_dihedral,
             pooling=pooling or "mean",
         )
+    if mt == "gnn_qfim_structured":
+        pd = int(config.qfim.per_qubit_dim)
+        qnl = int(getattr(config.qfim, "num_layers", 2))
+        qops = int(getattr(config.qfim, "ops_per_layer", 3))
+        return QFIMGNNStructured(
+            node_dim=node_dim,
+            qfim_per_qubit_dim=pd,
+            qfim_num_layers=qnl,
+            qfim_ops_per_layer=qops,
+            hidden_dim=hidden,
+            num_layers=layers,
+            include_dihedral=include_dihedral,
+            pooling=pooling or "mean",
+        )
+    if mt == "gnn_qfim_conv":
+        pd = int(config.qfim.per_qubit_dim)
+        return QFIMGNNConv(
+            node_dim=node_dim,
+            qfim_per_qubit_dim=pd,
+            qfim_conv_channels=int(getattr(config.qfim, "conv_channels", 16)),
+            qfim_kernel_size=int(getattr(config.qfim, "kernel_size", 3)),
+            qfim_out_dim=int(getattr(config.qfim, "out_dim", 8)),
+            hidden_dim=hidden,
+            num_layers=layers,
+            include_dihedral=include_dihedral,
+            pooling=pooling or "mean",
+        )
     raise ValueError(f"Unknown model.type={mt!r}")
 
 
 def _forward(model: nn.Module, batch, model_type: str) -> torch.Tensor:
-    if model_type == "gnn_qfim":
+    if model_type in ("gnn_qfim", "gnn_qfim_structured", "gnn_qfim_conv"):
         nq = int(batch.qfim_nq[0].item())
         return model(
             batch.x, batch.edge_index, batch.edge_attr,
@@ -174,6 +201,16 @@ def main():
         ])
 
         best_val = float("inf")
+        best_val_mae = float("inf")
+        epochs_since_mae_improved = 0
+        # ------------------------ Early stopping --------------------------
+        #
+        # Early stopping on val_mae. Patience = N epochs with no improvement
+        # over the best-so-far val_mae before we stop. Disable by setting
+        # setup.early_stop_patience to 0 (or leaving it absent with <=0).
+        #
+        # ------------------------------------------------------------------
+        early_stop_patience = int(getattr(config.setup, "early_stop_patience", 10))
         epochs = int(config.setup.epochs)
         save_every_epoch = bool(getattr(config.setup, "save_every_epoch", False))
         for epoch in range(1, epochs + 1):
@@ -219,7 +256,37 @@ def main():
                     f"{best_val:.8f}",
                 ])
 
-    logger.info(f"done | best_val={best_val:.4f} | artifacts in {model_dir}")
+            # ---------------------------------------------------------------
+            # Early stopping
+            # ---------------------------------------------------------------
+            # Track the best val_mae seen so far. If it improves this epoch,
+            # reset the stale-counter; otherwise increment it. When the
+            # counter reaches `early_stop_patience`, stop training — further
+            # epochs are unlikely to improve val_mae. Checkpoints stay as
+            # they were (best.pt still tracks val_loss); this only controls
+            # the training loop termination.
+            # ---------------------------------------------------------------
+            if val_mae < best_val_mae:
+                best_val_mae = val_mae
+                epochs_since_mae_improved = 0
+            else:
+                epochs_since_mae_improved += 1
+
+            if (
+                early_stop_patience > 0
+                and epochs_since_mae_improved >= early_stop_patience
+            ):
+                logger.info(
+                    f"early stopping at epoch {epoch} | "
+                    f"val_mae did not improve for {early_stop_patience} epochs | "
+                    f"best_val_mae={best_val_mae:.4f}"
+                )
+                break
+
+    logger.info(
+        f"done | best_val={best_val:.4f} | best_val_mae={best_val_mae:.4f} "
+        f"| artifacts in {model_dir}"
+    )
 
 
 if __name__ == "__main__":

@@ -163,8 +163,13 @@ class QM9GraphDataset(Dataset):
             rot_block = np.asarray(
                 self._h5["qfim"][idx, :n_rot, :n_rot], dtype=np.float32
             )
-            # (n_rot, n_rot) -> (nq, pd, nq, pd) -> (nq, nq, pd, pd)
-            rot_block = rot_block.reshape(nq, pd, nq, pd).transpose(0, 2, 1, 3)
+            # bioQINN stores rot-gate weights as (num_layers, ops_per_layer,
+            # n_qubits) and PennyLane's metric_tensor flattens in C order, so
+            # the qubit axis is the FASTEST-varying one along the 60-dim flat
+            # parameter vector. Verified empirically by probe_qfim_reshape.py
+            # against a recomputed QFIM -- see commit log.
+            # (n_rot, n_rot) -> (pd, nq, pd, nq) -> (nq, nq, pd, pd)
+            rot_block = rot_block.reshape(pd, nq, pd, nq).transpose(1, 3, 0, 2)
             # Add leading batch axis so PyG's concat-along-dim-0 produces the
             # desired (B, nq, nq, pd, pd) stacked tensor in the batched Data.
             data.qfim_block = torch.from_numpy(

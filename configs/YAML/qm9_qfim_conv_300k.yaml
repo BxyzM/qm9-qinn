@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_qfim_huber_2"
+  run_id: "gnn_qfim_conv"
   train: true
   batch_size: 256
   epochs: 100
@@ -12,9 +12,10 @@ setup:
   val_n: null
   test_n: null
   save_every_epoch: false
+  early_stop_patience: 10
 
 model:
-  type: "gnn_qfim"
+  type: "gnn_qfim_conv"
   node_dim: 9
   hidden_dim: 128
   num_layers: 6
@@ -23,7 +24,10 @@ model:
 
 qfim:
   n_qubits: 10
-  per_qubit_dim: 6             # num_layers (2) * operations_per_layer (3)
+  per_qubit_dim: 6             # num_layers (2) * ops_per_layer (3)
+  conv_channels: 16            # Conv1d hidden width
+  kernel_size: 3               # spans one ansatz layer (3 ops)
+  out_dim: 8                   # compressed edge-feature size after conv
 
 optimizer:
   name: "adam"
@@ -40,4 +44,4 @@ paths:
   train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
   val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
   test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
-  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim_conv"
