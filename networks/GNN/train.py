@@ -1,11 +1,15 @@
 """
 Unified GNN training entry for QM9.
 
-Selects model via config.model.type in {"gnn", "gnn_invariant", "gnn_qfim"}.
+Selects model via config.model.type:
+    "gnn"      -> baseline GNN (geometry only, no QFIM)
+    "gnn_qfim" -> baseline + QFIM edge head (qfim.embed_op picks the head)
+
 Uses the map-style vectorized loader in data_handlers.qm9_graph_loader.
 
 Usage:
-    python -m networks.GNN.train --config configs/YAML/qm9_gnn.yaml
+    python -m networks.GNN.train --config configs/YAML/qm9.yaml
+    python -m networks.GNN.train --config configs/YAML/qm9_qfim.yaml
 """
 
 from __future__ import annotations
@@ -23,76 +27,35 @@ from tqdm import tqdm
 
 from configs.configuration import Config
 from data_handlers.qm9_graph_loader import build_loaders_from_config
-from networks.GNN import GNN, InvariantGNN, QFIMGNN, QFIMGNNStructured, QFIMGNNConv
+from networks.GNN import GNN, QFIMGNN
 
 
 def _build_model(config) -> nn.Module:
     mt = config.model.type
-    node_dim = int(getattr(config.model, "node_dim", 9))
-    hidden = int(getattr(config.model, "hidden_dim", 64))
-    layers = int(getattr(config.model, "num_layers", 6))
-    include_dihedral = bool(getattr(config.model, "include_dihedral", True))
-    pooling = getattr(config.model, "pooling", None)
+    num_mp_layers = int(getattr(config.model, "num_layers", 6))
+    pooling = getattr(config.model, "pooling", None) or "mean"
 
     if mt == "gnn":
         return GNN(
-            node_dim=node_dim,
-            edge_dim=4,
-            hidden_dim=hidden,
-            num_layers=layers,
+            num_mp_layers=num_mp_layers,
+            pooling=pooling,
         )
-    if mt == "gnn_invariant":
-        kwargs = dict(
-            node_dim=node_dim,
-            hidden_dim=hidden,
-            num_layers=layers,
-            include_dihedral=include_dihedral,
-        )
-        if pooling is not None:
-            kwargs["pooling"] = pooling
-        return InvariantGNN(**kwargs)
     if mt == "gnn_qfim":
         pd = int(config.qfim.per_qubit_dim)
+        embed_op = str(getattr(config.qfim, "embed_op", "mlp"))
+        out_dim = int(getattr(config.qfim, "out_dim", 4))
         return QFIMGNN(
-            node_dim=node_dim,
+            num_mp_layers=num_mp_layers,
+            pooling=pooling,
             qfim_per_qubit_dim=pd,
-            hidden_dim=hidden,
-            num_layers=layers,
-            include_dihedral=include_dihedral,
-            pooling=pooling or "mean",
-        )
-    if mt == "gnn_qfim_structured":
-        pd = int(config.qfim.per_qubit_dim)
-        qnl = int(getattr(config.qfim, "num_layers", 2))
-        qops = int(getattr(config.qfim, "ops_per_layer", 3))
-        return QFIMGNNStructured(
-            node_dim=node_dim,
-            qfim_per_qubit_dim=pd,
-            qfim_num_layers=qnl,
-            qfim_ops_per_layer=qops,
-            hidden_dim=hidden,
-            num_layers=layers,
-            include_dihedral=include_dihedral,
-            pooling=pooling or "mean",
-        )
-    if mt == "gnn_qfim_conv":
-        pd = int(config.qfim.per_qubit_dim)
-        return QFIMGNNConv(
-            node_dim=node_dim,
-            qfim_per_qubit_dim=pd,
-            qfim_conv_channels=int(getattr(config.qfim, "conv_channels", 16)),
-            qfim_kernel_size=int(getattr(config.qfim, "kernel_size", 3)),
-            qfim_out_dim=int(getattr(config.qfim, "out_dim", 8)),
-            hidden_dim=hidden,
-            num_layers=layers,
-            include_dihedral=include_dihedral,
-            pooling=pooling or "mean",
+            qfim_embed_op=embed_op,
+            qfim_out_dim=out_dim,
         )
     raise ValueError(f"Unknown model.type={mt!r}")
 
 
 def _forward(model: nn.Module, batch, model_type: str) -> torch.Tensor:
-    if model_type in ("gnn_qfim", "gnn_qfim_structured", "gnn_qfim_conv"):
+    if model_type == "gnn_qfim":
         nq = int(batch.qfim_nq[0].item())
         return model(
             batch.x, batch.edge_index, batch.edge_attr,
