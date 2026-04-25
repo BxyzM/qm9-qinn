@@ -60,9 +60,18 @@ qm9-qinn/
 
 ### `GNN` (baseline, `gnn.py`)
 
-Compact invariant message-passing GNN on 4-dim node features.
+Invariant message-passing GNN with embedded discrete node attributes,
+geometric edge features, and a learned bond-type gate.
 
-**Node features** (4 dims): `[Z, x, y, z]` — atomic number and 3D position.
+<!-- ---------- changed (v2): node features now embed Z, hybridization, aromatic, n_H ---------- -->
+**Node features** (21 dims, built from 4 discrete + 3 continuous fields):
+- `Z` (atomic number) → `nn.Embedding(10, 6)`
+- `hybridization` (0=none, 1=SP, 2=SP², 3=SP³) → `nn.Embedding(4, 4)`
+- `aromatic_flag` (0/1) → `nn.Embedding(2, 4)`
+- `n_H` (0..4) → `nn.Embedding(5, 4)`
+- `x, y, z` — passed through directly.
+- Concatenated to 21 dims, fed to the node MLP.
+<!-- ---------- /changed ---------- -->
 
 **Edge features** (3 dims output, built from 13 raw dims):
 - `vec3_bond` (3): up to 3 bond angles `∠(k - i - j)` at source atom i,
@@ -75,30 +84,55 @@ Compact invariant message-passing GNN on 4-dim node features.
   filtered against `l = i` and `l = k` (3-ring degeneracy). Max of 9
   equals `(deg(i)-1) × (deg(j)-1)` at the upper bound.
 - `distance` (1): Euclidean bond length in Å.
-- Bond type enters as a **learnable multiplicative scalar** after the MLP:
-  `edge_out = (α · bond_type) · edge_mlp(vec3, vec4, distance)`, with
-  `α` a single learnable `nn.Parameter`. Bond type is an integer in
-  {1, 2, 3, 4}.
 
-**MLP shapes** (autoencoder-style expand then compress):
-- Node MLP: `4 → 8 → 16 → 8 → 4`
+<!-- ---------- changed (v2): bond_type is now an embedding, not a scalar ---------- -->
+- Bond type (0=padding, 1=single, 2=double, 3=triple, 4=aromatic) is a
+  discrete field. Each type gets a learned vector via `nn.Embedding(5,
+  edge_dim)` and is applied as an **element-wise multiplicative gate** on
+  the edge MLP output:
+  `edge_out = bond_embed(bond_type) * edge_mlp(vec3, vec4, distance)`.
+  Replaces the prior `α · bond_type` scalar form, which forced an
+  arithmetic ratio across types (e.g. double = 2 × single, aromatic = 4 ×
+  single) with no chemical justification.
+<!-- ---------- /changed ---------- -->
+
+<!-- ---------- changed (v2): wider MLPs + 8-dim node space ---------- -->
+**MLP shapes**:
+- Node MLP: `21 → 32 → 64 → 32 → 16 → 8`
 - Edge MLP: `13 → 6 → 8 → 16 → 8 → 3`
+<!-- ---------- /changed ---------- -->
 
-**Message passing**: 6 layers of `msg_mlp([x_i, x_j, edge_attr]) → 4`,
-sum-aggregated, residual. Operates in 4-dim node space throughout.
+<!-- ---------- changed (v2): MP and readout match wider node space ---------- -->
+**Message passing**: 6 layers of `msg_mlp([x_i, x_j, edge_attr]) → 8`,
+sum-aggregated, residual. Operates in **8-dim** node space.
 
-**Readout**: mean pool → `Linear(4, 16) → ReLU → Linear(16, 1)`.
+**Readout**: pooled (mean / max / add, configurable via `model.pooling`)
+→ `Linear(8, 32) → ReLU → Linear(32, 1)`. Mean is correct for intensive
+targets like the gap; max can be a cheap ablation.
+<!-- ---------- /changed ---------- -->
 
 **Target standardization**: `fit_target_stats(train_loader)` must run once
 before training. Stats live in state_dict buffers.
 
-~1200 parameters total.
+<!-- ---------- changed (v2): param count grew with the wider model ---------- -->
+~7.5k parameters total (was ~1.2k under the v1 4-dim-node model).
+<!-- ---------- /changed ---------- -->
+
+**v1 → v2 changes summary:**
+- Node features expanded from `[Z, x, y, z]` (4 dims) to embedded
+  `[Z_emb, hyb_emb, arom_emb, nH_emb, x, y, z]` (21 dims).
+- Bond-type contribution changed from learned scalar `α · bond_type` to
+  learned embedding vector `bond_embed(bond_type)`.
+- Node hidden dim increased from 4 to 8; node MLP widened accordingly.
+- Readout widened from `Linear(4, 16) → 1` to `Linear(8, 32) → 1`.
+- Pooling explicitly configurable in YAML (`model.pooling: mean | max |
+  add`).
 
 ### `QFIMGNN` (`gnn_qfim.py`)
 
 Extends `GNN` with a 4-dim per-edge QFIM summary concatenated onto the
-geometric edge feature (7-dim edges in MP). The QFIM head is swappable
-via config:
+geometric edge feature (7-dim edges in MP, alongside the 8-dim node
+space). The QFIM head is swappable via config:
 
 | `qfim.embed_op` | Mechanism |
 |---|---|

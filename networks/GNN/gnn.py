@@ -1,32 +1,34 @@
 """
 Baseline GNN for QM9 HOMO-LUMO gap regression.
 
-Node features (4D per atom):
-    [Z, x, y, z]   - atomic number + 3D position.
+Node features per atom:
+    Z, hybridization, aromatic_flag, n_H  -- discrete fields turned
+                                             continuous via nn.Embedding.
+    x, y, z                               -- continuous coordinates.
+
+    Default embedding widths give a 21-dim node input, fed to
+    node_mlp(21 -> 32 -> 64 -> 32 -> 16 -> 8) -> node_dim = 8.
 
 Edge features per bond (i -> j):
-    vec3  : up to 3 bond angles  angle(k - i - j) at the source endpoint i,
-            one per bonded neighbor k != j, padded with zeros to length 3.
-            **Raw loader order is preserved** -- the HDF5 maker sorts atoms
-            by descending atomic number, so position 0 is the heaviest
-            bonded neighbor by construction. Position-dependent weights in
-            the edge MLP can learn physical meaning like "angle involving
-            the heaviest neighbor matters more."
-    vec4  : up to 9 unsigned dihedrals  dih(k - i - j - l), one per valid
-            (k, l) 4-atom chain where k bonds to i (k != j), l bonds to j
-            (l != i, l != k), padded with zeros to length 9.
-    dist  : bond distance in Angstroms (scalar).
-    ==> concat = 13-dim edge input (3 + 9 + 1).
-    edge_mlp(13 -> 6 -> 8 -> 16 -> 8 -> 3)  produces 3 learned edge dims.
-    Bond type enters as a learnable multiplicative scalar:
-        edge_out = (alpha * bond_type) * edge_mlp(vec3, vec4, dist)
+    vec3  : up to 3 bond angles  angle(k - i - j) at source atom i, padded
+            with zeros to length 3.
+    vec4  : up to 9 unsigned dihedrals  dih(k - i - j - l) at edge (i, j),
+            padded with zeros to length 9.
+    dist  : bond distance in Angstroms.
+    ==> 13-dim raw edge input.
+    edge_mlp(13 -> 6 -> 8 -> 16 -> 8 -> 3) -> 3 learned edge dims.
 
-Node embedding (expand-then-compress MLP):
-    node_mlp(4 -> 8 -> 16 -> 8 -> 4)
+    Bond type is a discrete field (0=padding, 1=single, 2=double,
+    3=triple, 4=aromatic). It enters as a learned **multiplicative
+    embedding vector**:
+        edge_out = bond_embed(bond_type) * edge_mlp(vec3, vec4, dist)
+    bond_embed has output dim equal to edge_mlp's output (3 by default),
+    so the multiply is element-wise.
 
-Message passing: 6 x InvariantMP with sum aggregation and residual, operating
-in 4-dim node space with 3-dim edge features. Mean pool over nodes, tiny
-readout to scalar gap in eV.
+Message passing: 6 x InvariantMP with sum aggregation and residual,
+operating in 8-dim node space with 3-dim edge features. Pooling is
+configurable (mean / max / add); mean is appropriate for intensive
+targets like the HOMO-LUMO gap.
 
 Target standardization:
     Stats fit once via model.fit_target_stats(train_loader) before training.
@@ -62,9 +64,22 @@ _POOLINGS = {
     "max": global_max_pool,
 }
 
-# Column indices into the 9-dim HDF5 node feature vector.
-_Z_COL = 0
+# Column indices into the 9-dim HDF5 node feature vector
+# (see data_processors/h5_maker_qm9.py for the layout).
+_Z_COL = 0           # atomic number, integer in {1, 6, 7, 8, 9}
+_AROM_COL = 1        # aromatic flag, integer in {0, 1}
+_HYB_COL = 2         # hybridization, integer in {0=none, 1=SP, 2=SP2, 3=SP3}
+_NH_COL = 3          # attached hydrogen count, integer in {0, 1, 2, 3, 4}
 _COORD_COLS = slice(4, 7)
+
+# Vocabulary sizes for the discrete -> continuous embeddings. Bumped a bit
+# above the actual max so accidental out-of-range values fail loudly via
+# IndexError instead of silently aliasing.
+_VOCAB_Z = 10        # Z up to 9 in CHNOF
+_VOCAB_HYB = 4       # 0..3
+_VOCAB_AROM = 2      # 0/1
+_VOCAB_NH = 5        # 0..4
+_VOCAB_BOND = 5      # 0=padding, 1=single, 2=double, 3=triple, 4=aromatic
 
 # Column indices into the 4-dim HDF5 edge feature vector: bond_type is [0],
 # distance is [3] (theta, phi at [1], [2] are not used; we recompute geometry
@@ -358,9 +373,9 @@ def _build_mlp(dims: Tuple[int, ...]) -> nn.Sequential:
 
 class GNN(nn.Module):
     """
-    Baseline GNN on 4-dim [Z, x, y, z] node features and 3-dim learned
-    edge features (geometry only, no QFIM). This is the post-refactor
-    successor to InvariantGNN.
+    Baseline GNN with discrete-field embeddings for node features
+    (Z, hybridization, aromatic, n_H) plus 3D coordinates, and a learned
+    bond-type multiplier on the geometric edge features.
     """
 
     DEFAULT_TARGET_INDEX = 4           # PyG QM9 layout: 4 = HOMO-LUMO gap (eV)
@@ -368,7 +383,11 @@ class GNN(nn.Module):
     def __init__(
         self,
         num_mp_layers: int = 6,
-        node_mlp_dims: Tuple[int, ...] = (4, 8, 16, 8, 4),
+        embed_z_dim: int = 6,
+        embed_hyb_dim: int = 4,
+        embed_arom_dim: int = 4,
+        embed_nH_dim: int = 4,
+        node_mlp_dims: Tuple[int, ...] = (21, 32, 64, 32, 16, 8),
         edge_mlp_dims: Tuple[int, ...] = (13, 6, 8, 16, 8, 3),
         max_neighbors: int = MAX_NEIGHBORS,
         max_chains: int = MAX_CHAINS,
@@ -377,8 +396,12 @@ class GNN(nn.Module):
         super().__init__()
         if pooling not in _POOLINGS:
             raise ValueError(f"pooling must be one of {list(_POOLINGS)}; got {pooling!r}")
-        if node_mlp_dims[0] != 4:
-            raise ValueError(f"node_mlp_dims must start at 4 ([Z, x, y, z]); got {node_mlp_dims[0]}")
+        expected_node_in = embed_z_dim + embed_hyb_dim + embed_arom_dim + embed_nH_dim + 3
+        if node_mlp_dims[0] != expected_node_in:
+            raise ValueError(
+                f"node_mlp_dims[0]={node_mlp_dims[0]} inconsistent with "
+                f"sum of embedding dims + 3 (xyz) = {expected_node_in}"
+            )
         if edge_mlp_dims[0] != max_neighbors + max_chains + 1:
             raise ValueError(
                 f"edge_mlp_dims[0]={edge_mlp_dims[0]} inconsistent with "
@@ -390,24 +413,34 @@ class GNN(nn.Module):
         self.edge_dim = edge_mlp_dims[-1]
         self._pool = _POOLINGS[pooling]
 
+        # Discrete -> continuous embeddings for the categorical node fields.
+        # Each is a small lookup table; total embedding params are tiny.
+        self.embed_Z = nn.Embedding(_VOCAB_Z, embed_z_dim)
+        self.embed_hyb = nn.Embedding(_VOCAB_HYB, embed_hyb_dim)
+        self.embed_arom = nn.Embedding(_VOCAB_AROM, embed_arom_dim)
+        self.embed_nH = nn.Embedding(_VOCAB_NH, embed_nH_dim)
+
         self.node_mlp = _build_mlp(node_mlp_dims)
         self.edge_mlp = _build_mlp(edge_mlp_dims)
 
-        # Learnable scalar prefactor on bond_type. bond_type is an integer
-        # in {1, 2, 3, 4}; alpha scales it into a learned regime without
-        # embedding.
-        self.bond_alpha = nn.Parameter(torch.tensor(1.0))
+        # Bond type is a discrete field. Each type gets a learned vector of
+        # the same width as edge_mlp's output, used as a multiplicative
+        # gate: edge_out = bond_embed(bond_type) * edge_mlp(...). This
+        # replaces the earlier alpha * bond_type scalar form, which forced
+        # an arithmetic ratio across types (e.g. double=2*single) that has
+        # no chemical justification (especially for type=4 aromatic).
+        self.bond_embed = nn.Embedding(_VOCAB_BOND, self.edge_dim)
 
         self.mp_layers = nn.ModuleList(
             [InvariantMP(self.node_dim, self.edge_dim) for _ in range(num_mp_layers)]
         )
 
-        # Readout: 4 -> 16 -> 1. Intentionally small to match the model's
-        # overall compact scale.
+        # Readout: node_dim -> 32 -> 1. Wider than before to match the
+        # wider node space (8 instead of 4).
         self.readout = nn.Sequential(
-            nn.Linear(self.node_dim, 16),
+            nn.Linear(self.node_dim, 32),
             nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Linear(32, 1),
         )
 
         self.register_buffer("target_mean", torch.zeros(1))
@@ -463,10 +496,25 @@ class GNN(nn.Module):
     # --- feature prep (reused by QFIMGNN) ---------------------------------
 
     def build_node_feat(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract [Z, x, y, z] from the loader's 9-dim node feature tensor."""
-        Z = x[:, _Z_COL:_Z_COL + 1]
+        """
+        Build the per-atom continuous representation by looking up each
+        discrete field in its embedding and concatenating with xyz.
+
+        Returns (N, embed_z_dim + embed_hyb_dim + embed_arom_dim +
+                 embed_nH_dim + 3).
+        """
+        Z = x[:, _Z_COL].long()
+        hyb = x[:, _HYB_COL].long()
+        arom = x[:, _AROM_COL].long()
+        nH = x[:, _NH_COL].long()
         coords = x[:, _COORD_COLS]
-        return torch.cat([Z, coords], dim=-1)
+        return torch.cat([
+            self.embed_Z(Z),
+            self.embed_hyb(hyb),
+            self.embed_arom(arom),
+            self.embed_nH(nH),
+            coords,
+        ], dim=-1)
 
     def build_edge_feat(
         self,
@@ -480,8 +528,10 @@ class GNN(nn.Module):
             edge_attr_loader, coords, edge_index,
             max_neighbors=self.max_neighbors, max_chains=self.max_chains,
         )
-        e = self.edge_mlp(raw)                                    # (E, 3)
-        e = (self.bond_alpha * bond_type).unsqueeze(-1) * e       # bond-type scaling
+        e = self.edge_mlp(raw)                                    # (E, edge_dim)
+        # Element-wise multiply by the bond-type embedding vector. Each of
+        # the 5 bond types (incl. padding=0) gets its own learned gate.
+        e = self.bond_embed(bond_type.long()) * e
         return e
 
     # --- forward ----------------------------------------------------------

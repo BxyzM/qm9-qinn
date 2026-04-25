@@ -195,13 +195,18 @@ class QFIMGNN(GNN):
     """
     Baseline GNN extended with a QFIM edge feature. The QFIM head is chosen
     by name and produces (E, qfim_out_dim) per edge; this is concatenated
-    onto the 3-dim geometric edge feature so MP sees 7-dim edges.
+    onto the 3-dim geometric edge feature so MP sees (3 + qfim_out_dim)
+    edge features. Defaults: node_dim=8, edge_dim=7.
     """
 
     def __init__(
         self,
         num_mp_layers: int = 6,
-        node_mlp_dims: Tuple[int, ...] = (4, 8, 16, 8, 4),
+        embed_z_dim: int = 6,
+        embed_hyb_dim: int = 4,
+        embed_arom_dim: int = 4,
+        embed_nH_dim: int = 4,
+        node_mlp_dims: Tuple[int, ...] = (21, 32, 64, 32, 16, 8),
         edge_mlp_dims: Tuple[int, ...] = (13, 6, 8, 16, 8, 3),
         max_neighbors: int = MAX_NEIGHBORS,
         max_chains: int = MAX_CHAINS,
@@ -212,6 +217,10 @@ class QFIMGNN(GNN):
     ):
         super().__init__(
             num_mp_layers=num_mp_layers,
+            embed_z_dim=embed_z_dim,
+            embed_hyb_dim=embed_hyb_dim,
+            embed_arom_dim=embed_arom_dim,
+            embed_nH_dim=embed_nH_dim,
             node_mlp_dims=node_mlp_dims,
             edge_mlp_dims=edge_mlp_dims,
             max_neighbors=max_neighbors,
