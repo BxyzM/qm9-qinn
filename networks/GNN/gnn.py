@@ -380,9 +380,9 @@ class InvariantMP(MessagePassing):
         else:
             raise ValueError(f"msg_layers must be 1 or 2; got {msg_layers}")
 
-        self.edge_updater = None
+        self._edge_update_mlp = None
         if per_layer_edge_update:
-            self.edge_updater = nn.Sequential(
+            self._edge_update_mlp = nn.Sequential(
                 nn.Linear(edge_dim, edge_dim),
                 _make_activation(activation),
             )
@@ -393,8 +393,8 @@ class InvariantMP(MessagePassing):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
     ) -> torch.Tensor:
-        if self.edge_updater is not None:
-            edge_attr = edge_attr + self.edge_updater(edge_attr)
+        if self._edge_update_mlp is not None:
+            edge_attr = edge_attr + self._edge_update_mlp(edge_attr)
         out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
         return x + out
 
