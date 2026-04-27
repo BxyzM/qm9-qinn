@@ -1,0 +1,41 @@
+setup:
+  run_id: "gnn_v36"
+  train: true
+  batch_size: 256
+  epochs: 100                # longer for cosine schedule + warmup
+  shuffle: true
+  num_workers: 1
+  targets:
+    - "gap"
+  seed: 42
+  train_n: null
+  val_n: null
+  test_n: null
+  save_every_epoch: true
+  early_stop_patience: 20    # raised because cosine LR keeps moving
+
+model:
+  type: "gnn"
+  num_layers: 6
+  pooling: "mean_max"        # concat(mean, max) — doubles readout input
+  activation: "silu"         # was relu in v35
+  mlp_residual: true         # residual connections in node/edge MLPs
+  msg_layers: 2              # 2-layer message MLP (was 1-layer Linear)
+  per_layer_edge_update: true  # each MP layer refines edge_attr (+small Linear)
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-3
+  schedule: "cosine"         # was implicit "plateau"
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+
+loss:
+  name: "huber"
+  delta: 0.1
+
+paths:
+  train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn"

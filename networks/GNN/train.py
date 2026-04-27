@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import pathlib
 import time
 from typing import Tuple
@@ -34,11 +35,19 @@ def _build_model(config) -> nn.Module:
     mt = config.model.type
     num_mp_layers = int(getattr(config.model, "num_layers", 6))
     pooling = getattr(config.model, "pooling", None) or "mean"
+    activation = str(getattr(config.model, "activation", "relu"))
+    mlp_residual = bool(getattr(config.model, "mlp_residual", False))
+    msg_layers = int(getattr(config.model, "msg_layers", 1))
+    per_layer_edge_update = bool(getattr(config.model, "per_layer_edge_update", False))
 
     if mt == "gnn":
         return GNN(
             num_mp_layers=num_mp_layers,
             pooling=pooling,
+            activation=activation,
+            mlp_residual=mlp_residual,
+            msg_layers=msg_layers,
+            per_layer_edge_update=per_layer_edge_update,
         )
     if mt == "gnn_qfim":
         pd = int(config.qfim.per_qubit_dim)
@@ -47,6 +56,10 @@ def _build_model(config) -> nn.Module:
         return QFIMGNN(
             num_mp_layers=num_mp_layers,
             pooling=pooling,
+            activation=activation,
+            mlp_residual=mlp_residual,
+            msg_layers=msg_layers,
+            per_layer_edge_update=per_layer_edge_update,
             qfim_per_qubit_dim=pd,
             qfim_embed_op=embed_op,
             qfim_out_dim=out_dim,
@@ -138,12 +151,34 @@ def main():
 
     lr = float(config.optimizer.lr)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt,
-        factor=float(getattr(config.optimizer, "decay_factor", 0.5)),
-        patience=int(getattr(config.optimizer, "decay_patience", 5)),
-        threshold=float(getattr(config.optimizer, "decay_threshold", 1e-3)),
-    )
+    schedule_kind = str(getattr(config.optimizer, "schedule", "plateau")).lower()
+    if schedule_kind == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            factor=float(getattr(config.optimizer, "decay_factor", 0.5)),
+            patience=int(getattr(config.optimizer, "decay_patience", 5)),
+            threshold=float(getattr(config.optimizer, "decay_threshold", 1e-3)),
+        )
+    elif schedule_kind == "cosine":
+        warmup_epochs = int(getattr(config.optimizer, "warmup_epochs", 5))
+        total_epochs = int(config.setup.epochs)
+        min_lr = float(getattr(config.optimizer, "min_lr", 1e-5))
+        min_ratio = min_lr / lr
+        cos_epochs = max(1, total_epochs - warmup_epochs)
+
+        def _lr_lambda(epoch_idx: int) -> float:
+            if epoch_idx < warmup_epochs:
+                return (epoch_idx + 1) / max(1, warmup_epochs)
+            t = (epoch_idx - warmup_epochs) / cos_epochs
+            t = min(max(t, 0.0), 1.0)
+            cos = 0.5 * (1.0 + math.cos(math.pi * t))
+            return min_ratio + (1.0 - min_ratio) * cos
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
+    else:
+        raise ValueError(
+            f"optimizer.schedule must be 'plateau' or 'cosine'; got {schedule_kind!r}"
+        )
 
     model_dir = pathlib.Path(config.paths.model_dir) / config.setup.run_id
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -186,7 +221,10 @@ def main():
                 model, val_loader, loss_fn, opt, device, config.model.type,
                 train=False, desc=f"val   {epoch:03d}",
             )
-            scheduler.step(val_loss)
+            if schedule_kind == "plateau":
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
             dt = time.time() - t0
             current_lr = opt.param_groups[0]["lr"]
 

@@ -340,16 +340,52 @@ def build_edge_raw_features(
 # ---------------------------------------------------------------------------
 
 class InvariantMP(MessagePassing):
-    """Sum-aggregating MP block with residual update. LayerNorm inside msg."""
+    """
+    Sum-aggregating MP block with residual update. LayerNorm inside msg.
 
-    def __init__(self, node_dim: int, edge_dim: int):
+    Configurable:
+      - activation: "relu" (default) | "silu" | "gelu"
+      - msg_layers: 1 (default, single Linear) | 2 (Linear-Act-Linear)
+      - per_layer_edge_update: if True, applies a small Linear+act on
+        edge_attr before consuming it, letting edge representations evolve
+        through the MP stack. Default False (preserves baseline behavior).
+    """
+
+    def __init__(
+        self,
+        node_dim: int,
+        edge_dim: int,
+        activation: str = "relu",
+        msg_layers: int = 1,
+        per_layer_edge_update: bool = False,
+    ):
         super().__init__(aggr="add")
         msg_in = 2 * node_dim + edge_dim
-        self.msg_mlp = nn.Sequential(
-            nn.Linear(msg_in, node_dim),
-            nn.LayerNorm(node_dim),
-            nn.ReLU(),
-        )
+        if msg_layers == 1:
+            self.msg_mlp = nn.Sequential(
+                nn.Linear(msg_in, node_dim),
+                nn.LayerNorm(node_dim),
+                _make_activation(activation),
+            )
+        elif msg_layers == 2:
+            hidden = max(node_dim, msg_in // 2)
+            self.msg_mlp = nn.Sequential(
+                nn.Linear(msg_in, hidden),
+                nn.LayerNorm(hidden),
+                _make_activation(activation),
+                nn.Linear(hidden, node_dim),
+                nn.LayerNorm(node_dim),
+                _make_activation(activation),
+            )
+        else:
+            raise ValueError(f"msg_layers must be 1 or 2; got {msg_layers}")
+
+        self.edge_updater = None
+        if per_layer_edge_update:
+            self.edge_updater = nn.Sequential(
+                nn.Linear(edge_dim, edge_dim),
+                _make_activation(activation),
+            )
 
     def forward(
         self,
@@ -357,6 +393,8 @@ class InvariantMP(MessagePassing):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
     ) -> torch.Tensor:
+        if self.edge_updater is not None:
+            edge_attr = edge_attr + self.edge_updater(edge_attr)
         out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
         return x + out
 
@@ -367,25 +405,78 @@ class InvariantMP(MessagePassing):
 
 
 # ---------------------------------------------------------------------------
-# MLP builder
+# Activation factory
 # ---------------------------------------------------------------------------
 
-def _build_mlp(dims: Tuple[int, ...]) -> nn.Sequential:
+_ACTIVATIONS = {
+    "relu": nn.ReLU,
+    "silu": nn.SiLU,
+    "gelu": nn.GELU,
+}
+
+
+def _make_activation(name: str) -> nn.Module:
+    if name not in _ACTIVATIONS:
+        raise ValueError(f"activation must be one of {list(_ACTIVATIONS)}; got {name!r}")
+    return _ACTIVATIONS[name]()
+
+
+# ---------------------------------------------------------------------------
+# MLP builders
+# ---------------------------------------------------------------------------
+
+def _build_mlp(dims: Tuple[int, ...], activation: str = "relu") -> nn.Sequential:
     """
-    Build a Linear-ReLU stack from a sequence of layer widths.
+    Build a Linear-Activation stack from a sequence of layer widths.
 
-    Example: _build_mlp((4, 8, 16, 8, 4))
-             -> Linear(4,8) ReLU Linear(8,16) ReLU Linear(16,8) ReLU Linear(8,4)
-
-    ReLU is inserted between every pair of Linear layers, never after the
-    last one, so the final activation is left to the caller.
+    Activation is inserted between every pair of Linear layers, never after
+    the last one, so the final activation is left to the caller.
     """
     layers: list = []
     for idx in range(len(dims) - 1):
         layers.append(nn.Linear(dims[idx], dims[idx + 1]))
         if idx < len(dims) - 2:
-            layers.append(nn.ReLU())
+            layers.append(_make_activation(activation))
     return nn.Sequential(*layers)
+
+
+class _ResidualBlock(nn.Module):
+    """Linear -> Activation -> Linear, with residual when in_dim == out_dim."""
+
+    def __init__(self, in_dim: int, out_dim: int, activation: str = "relu"):
+        super().__init__()
+        self.lin1 = nn.Linear(in_dim, out_dim)
+        self.act = _make_activation(activation)
+        self.lin2 = nn.Linear(out_dim, out_dim)
+        self.use_residual = in_dim == out_dim
+        if not self.use_residual:
+            self.proj = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.lin2(self.act(self.lin1(x)))
+        skip = x if self.use_residual else self.proj(x)
+        return h + skip
+
+
+def _build_residual_mlp(dims: Tuple[int, ...], activation: str = "relu") -> nn.Sequential:
+    """
+    Build a stack of residual blocks: each block is a 2-layer MLP with skip
+    connection. Inter-block activation is inserted between blocks.
+    """
+    blocks: list = []
+    for idx in range(len(dims) - 1):
+        blocks.append(_ResidualBlock(dims[idx], dims[idx + 1], activation=activation))
+        if idx < len(dims) - 2:
+            blocks.append(_make_activation(activation))
+    return nn.Sequential(*blocks)
+
+
+def _build_optional_residual_mlp(
+    dims: Tuple[int, ...], activation: str = "relu", residual: bool = False,
+) -> nn.Sequential:
+    if residual:
+        return _build_residual_mlp(dims, activation=activation)
+    return _build_mlp(dims, activation=activation)
 
 
 # ---------------------------------------------------------------------------
@@ -413,10 +504,16 @@ class GNN(nn.Module):
         rbf_range: Tuple[float, float] = (0.0, 5.0),
         rbf_gamma: float = 4.0,
         pooling: str = "mean",
+        activation: str = "relu",
+        mlp_residual: bool = False,
+        msg_layers: int = 1,
+        per_layer_edge_update: bool = False,
     ):
         super().__init__()
-        if pooling not in _POOLINGS:
-            raise ValueError(f"pooling must be one of {list(_POOLINGS)}; got {pooling!r}")
+        # Pooling: "add" | "mean" | "max" | "mean_max" (concat mean and max).
+        valid_pools = list(_POOLINGS.keys()) + ["mean_max"]
+        if pooling not in valid_pools:
+            raise ValueError(f"pooling must be one of {valid_pools}; got {pooling!r}")
         expected_node_in = embed_z_dim + 3
         if node_mlp_dims[0] != expected_node_in:
             raise ValueError(
@@ -434,7 +531,7 @@ class GNN(nn.Module):
         self.rbf_gamma = rbf_gamma
         self.node_dim = node_mlp_dims[-1]
         self.edge_dim = edge_mlp_dims[-1]
-        self._pool = _POOLINGS[pooling]
+        self.pooling = pooling
 
         # RBF reference distances. Stored as a buffer so they move with the
         # model to GPU and travel with state_dict (the centers are fixed
@@ -447,17 +544,28 @@ class GNN(nn.Module):
         # Atomic-number embedding: only discrete chemistry feature kept.
         self.embed_Z = nn.Embedding(_VOCAB_Z, embed_z_dim)
 
-        self.node_mlp = _build_mlp(node_mlp_dims)
-        self.edge_mlp = _build_mlp(edge_mlp_dims)
-
-        self.mp_layers = nn.ModuleList(
-            [InvariantMP(self.node_dim, self.edge_dim) for _ in range(num_mp_layers)]
+        self.node_mlp = _build_optional_residual_mlp(
+            node_mlp_dims, activation=activation, residual=mlp_residual,
+        )
+        self.edge_mlp = _build_optional_residual_mlp(
+            edge_mlp_dims, activation=activation, residual=mlp_residual,
         )
 
-        # Readout: node_dim -> 32 -> 1.
+        self.mp_layers = nn.ModuleList([
+            InvariantMP(
+                self.node_dim, self.edge_dim,
+                activation=activation,
+                msg_layers=msg_layers,
+                per_layer_edge_update=per_layer_edge_update,
+            )
+            for _ in range(num_mp_layers)
+        ])
+
+        # Readout: pooled_dim -> 32 -> 1. mean_max doubles the input dim.
+        readout_in = self.node_dim * (2 if pooling == "mean_max" else 1)
         self.readout = nn.Sequential(
-            nn.Linear(self.node_dim, 32),
-            nn.ReLU(),
+            nn.Linear(readout_in, 32),
+            _make_activation(activation),
             nn.Linear(32, 1),
         )
 
@@ -563,6 +671,11 @@ class GNN(nn.Module):
         for layer in self.mp_layers:
             h = layer(h, edge_index, e)
 
-        g = self._pool(h, batch)                                  # (B, 4)
+        g = self._pool_nodes(h, batch)                            # (B, pooled_dim)
         z = self.readout(g).squeeze(-1)                           # (B,)
         return z * self.target_std + self.target_mean
+
+    def _pool_nodes(self, h: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        if self.pooling == "mean_max":
+            return torch.cat([global_mean_pool(h, batch), global_max_pool(h, batch)], dim=-1)
+        return _POOLINGS[self.pooling](h, batch)

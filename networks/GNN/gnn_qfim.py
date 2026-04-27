@@ -211,6 +211,10 @@ class QFIMGNN(GNN):
         rbf_range: Tuple[float, float] = (0.0, 5.0),
         rbf_gamma: float = 4.0,
         pooling: str = "mean",
+        activation: str = "relu",
+        mlp_residual: bool = False,
+        msg_layers: int = 1,
+        per_layer_edge_update: bool = False,
         qfim_per_qubit_dim: int = 6,
         qfim_embed_op: str = "mlp",
         qfim_out_dim: int = 4,
@@ -226,6 +230,10 @@ class QFIMGNN(GNN):
             rbf_range=rbf_range,
             rbf_gamma=rbf_gamma,
             pooling=pooling,
+            activation=activation,
+            mlp_residual=mlp_residual,
+            msg_layers=msg_layers,
+            per_layer_edge_update=per_layer_edge_update,
         )
         if qfim_embed_op not in _QFIM_HEADS:
             raise ValueError(
@@ -240,9 +248,15 @@ class QFIMGNN(GNN):
 
         # Rebuild MP stack with the new edge dim = geom 3 + qfim out dim.
         new_edge_dim = self.edge_dim + qfim_out_dim
-        self.mp_layers = nn.ModuleList(
-            [InvariantMP(self.node_dim, new_edge_dim) for _ in range(num_mp_layers)]
-        )
+        self.mp_layers = nn.ModuleList([
+            InvariantMP(
+                self.node_dim, new_edge_dim,
+                activation=activation,
+                msg_layers=msg_layers,
+                per_layer_edge_update=per_layer_edge_update,
+            )
+            for _ in range(num_mp_layers)
+        ])
 
     def forward(
         self,
@@ -272,6 +286,6 @@ class QFIMGNN(GNN):
         for layer in self.mp_layers:
             h = layer(h, edge_index, e)
 
-        g = self._pool(h, batch)                                      # (B, 4)
+        g = self._pool_nodes(h, batch)                                # (B, pooled_dim)
         z = self.readout(g).squeeze(-1)                               # (B,)
         return z * self.target_std + self.target_mean

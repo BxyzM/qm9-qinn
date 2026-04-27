@@ -1,0 +1,47 @@
+setup:
+  run_id: "gnn_qfim_v36_gated"   # change per run if you swap embed_op
+  train: true
+  batch_size: 256
+  epochs: 100
+  shuffle: true
+  num_workers: 1
+  targets:
+    - "gap"
+  seed: 42
+  train_n: null
+  val_n: null
+  test_n: null
+  save_every_epoch: true
+  early_stop_patience: 20
+
+model:
+  type: "gnn_qfim"
+  num_layers: 6
+  pooling: "mean_max"
+  activation: "silu"
+  mlp_residual: true
+  msg_layers: 2
+  per_layer_edge_update: true
+
+qfim:
+  n_qubits: 10
+  per_qubit_dim: 6
+  embed_op: "gated"             # smallest head — start with this
+  out_dim: 4
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-3
+  schedule: "cosine"
+  warmup_epochs: 5
+  min_lr: 1.0e-5
+
+loss:
+  name: "huber"
+  delta: 0.1
+
+paths:
+  train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim"
