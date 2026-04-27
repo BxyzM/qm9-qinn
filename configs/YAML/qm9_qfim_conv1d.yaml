@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_qfim_mlp"             # change per run (mlp / conv1d / conv2d / gated)
+  run_id: "gnn_qfim_conv1d"
   train: true
   batch_size: 256
   epochs: 100
@@ -11,18 +11,18 @@ setup:
   train_n: null
   val_n: null
   test_n: null
-  save_every_epoch: true
+  save_every_epoch: false
   early_stop_patience: 10
 
 model:
   type: "gnn_qfim"
   num_layers: 6           # message-passing depth
-  pooling: "max"
+  pooling: "mean"
 
 qfim:
   n_qubits: 10
   per_qubit_dim: 6        # bioQINN: num_layers (2) * ops_per_layer (3)
-  embed_op: "mlp"         # one of: mlp | conv1d | conv2d | gated
+  embed_op: "conv1d"      # one of: mlp | conv1d | conv2d | gated
   out_dim: 4              # qfim feature width per edge
 
 optimizer:

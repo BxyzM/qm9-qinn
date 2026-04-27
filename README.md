@@ -60,73 +60,70 @@ qm9-qinn/
 
 ### `GNN` (baseline, `gnn.py`)
 
-Invariant message-passing GNN with embedded discrete node attributes,
-geometric edge features, and a learned bond-type gate.
+SOTA-flavored compact GNN. Only atomic number is embedded on nodes; bond
+distance is encoded with a Gaussian RBF basis; hybridization, aromatic
+flag, n_H, and bond type are dropped (left to be learned implicitly by
+the MP stack from geometry).
 
-<!-- ---------- changed (v2): node features now embed Z, hybridization, aromatic, n_H ---------- -->
-**Node features** (21 dims, built from 4 discrete + 3 continuous fields):
+<!-- ---------- changed (v3): chemistry annotations dropped, only Z embedded ---------- -->
+**Node features** (9 dims):
 - `Z` (atomic number) → `nn.Embedding(10, 6)`
-- `hybridization` (0=none, 1=SP, 2=SP², 3=SP³) → `nn.Embedding(4, 4)`
-- `aromatic_flag` (0/1) → `nn.Embedding(2, 4)`
-- `n_H` (0..4) → `nn.Embedding(5, 4)`
 - `x, y, z` — passed through directly.
-- Concatenated to 21 dims, fed to the node MLP.
+- Concatenated to 9 dims.
+
+Hybridization, aromatic_flag, and n_H are no longer consumed. SOTA
+chemistry GNNs (SchNet, DimeNet, PaiNN) use only Z and rely on the MP
+stack to learn local chemistry from geometry.
 <!-- ---------- /changed ---------- -->
 
-**Edge features** (3 dims output, built from 13 raw dims):
+**Edge features** (3 dims output, built from 28 raw dims):
 - `vec3_bond` (3): up to 3 bond angles `∠(k - i - j)` at source atom i,
   padded with zeros. Neighbors are emitted in raw HDF5-loader order, which
   is sorted by descending atomic number (`h5_maker_qm9.py` permutation), so
-  position 0 is the heaviest bonded neighbor. Position-dependent MLP
-  weights can learn physical meaning ("angle involving the heavy neighbor
-  matters more"). Max of 3 covers every CHNOF atom (degree ≤ 4).
+  position 0 is the heaviest bonded neighbor.
 - `vec4_dihedral` (9): up to 9 unsigned dihedrals `dih(k - i - j - l)`,
-  filtered against `l = i` and `l = k` (3-ring degeneracy). Max of 9
-  equals `(deg(i)-1) × (deg(j)-1)` at the upper bound.
-- `distance` (1): Euclidean bond length in Å.
-
-<!-- ---------- changed (v2): bond_type is now an embedding, not a scalar ---------- -->
-- Bond type (0=padding, 1=single, 2=double, 3=triple, 4=aromatic) is a
-  discrete field. Each type gets a learned vector via `nn.Embedding(5,
-  edge_dim)` and is applied as an **element-wise multiplicative gate** on
-  the edge MLP output:
-  `edge_out = bond_embed(bond_type) * edge_mlp(vec3, vec4, distance)`.
-  Replaces the prior `α · bond_type` scalar form, which forced an
-  arithmetic ratio across types (e.g. double = 2 × single, aromatic = 4 ×
-  single) with no chemical justification.
+  filtered against `l = i` and `l = k` (3-ring degeneracy).
+<!-- ---------- changed (v3): scalar distance -> Gaussian RBF expansion ---------- -->
+- `rbf_distance` (16): Gaussian RBF expansion of the bond distance:
+  `exp(-γ (d - μ_k)²)` for 16 evenly-spaced centers in [0, 5] Å with
+  γ = 4. Replaces the v2 scalar distance. The localized basis lets the
+  edge MLP learn distance-regime-specific features (single bond, double
+  bond, 1,3 contact) rather than decoding meaning from a single scalar.
+<!-- ---------- /changed ---------- -->
+<!-- ---------- changed (v3): bond_type embedding removed ---------- -->
+- Bond type is no longer used. The edge MLP output is fed to MP as-is.
 <!-- ---------- /changed ---------- -->
 
-<!-- ---------- changed (v2): wider MLPs + 8-dim node space ---------- -->
+<!-- ---------- changed (v3): node MLP shrunk, edge MLP widened for RBF input ---------- -->
 **MLP shapes**:
-- Node MLP: `21 → 32 → 64 → 32 → 16 → 8`
-- Edge MLP: `13 → 6 → 8 → 16 → 8 → 3`
+- Node MLP: `9 → 16 → 32 → 16 → 8`
+- Edge MLP: `28 → 16 → 16 → 8 → 3`
 <!-- ---------- /changed ---------- -->
 
-<!-- ---------- changed (v2): MP and readout match wider node space ---------- -->
 **Message passing**: 6 layers of `msg_mlp([x_i, x_j, edge_attr]) → 8`,
-sum-aggregated, residual. Operates in **8-dim** node space.
+sum-aggregated, residual. Operates in 8-dim node space.
 
 **Readout**: pooled (mean / max / add, configurable via `model.pooling`)
 → `Linear(8, 32) → ReLU → Linear(32, 1)`. Mean is correct for intensive
-targets like the gap; max can be a cheap ablation.
-<!-- ---------- /changed ---------- -->
+targets like the gap.
 
 **Target standardization**: `fit_target_stats(train_loader)` must run once
 before training. Stats live in state_dict buffers.
 
-<!-- ---------- changed (v2): param count grew with the wider model ---------- -->
-~7.5k parameters total (was ~1.2k under the v1 4-dim-node model).
+<!-- ---------- changed (v3): param count smaller despite RBF (chemistry features dropped) ---------- -->
+~3.7k parameters total (v1: 1.2k, v2: 7.5k, v3: 3.7k).
 <!-- ---------- /changed ---------- -->
 
-**v1 → v2 changes summary:**
-- Node features expanded from `[Z, x, y, z]` (4 dims) to embedded
-  `[Z_emb, hyb_emb, arom_emb, nH_emb, x, y, z]` (21 dims).
-- Bond-type contribution changed from learned scalar `α · bond_type` to
-  learned embedding vector `bond_embed(bond_type)`.
-- Node hidden dim increased from 4 to 8; node MLP widened accordingly.
-- Readout widened from `Linear(4, 16) → 1` to `Linear(8, 32) → 1`.
-- Pooling explicitly configurable in YAML (`model.pooling: mean | max |
-  add`).
+**v2 → v3 changes summary:**
+- **Node features**: dropped hybridization, aromatic_flag, n_H. Only Z
+  embedded; xyz still passed. Node input: 21 dims → 9 dims.
+- **Edge features**: scalar distance replaced with 16-dim Gaussian RBF
+  expansion. Edge raw input: 13 dims → 28 dims.
+- **Bond type**: dropped entirely. The `bond_embed` multiplicative gate
+  is removed.
+- **MLP shapes**: node MLP shrunk to match smaller node input; edge MLP
+  widened to match larger edge input.
+- **Pooling**: mean (intensive target, default).
 
 ### `QFIMGNN` (`gnn_qfim.py`)
 

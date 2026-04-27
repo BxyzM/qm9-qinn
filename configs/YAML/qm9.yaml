@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_v2_max"
+  run_id: "gnn_v35_scaled"
   train: true
   batch_size: 256
   epochs: 100
@@ -17,7 +17,7 @@ setup:
 model:
   type: "gnn"
   num_layers: 6           # message-passing depth
-  pooling: "max"          # max over atom-level features for the readout
+  pooling: "max"         # intensive target -> mean over per-atom outputs
 
 optimizer:
   name: "adam"

@@ -1,29 +1,32 @@
 """
 Baseline GNN for QM9 HOMO-LUMO gap regression.
 
-Node features per atom:
-    Z, hybridization, aromatic_flag, n_H  -- discrete fields turned
-                                             continuous via nn.Embedding.
-    x, y, z                               -- continuous coordinates.
+Node features per atom (9 dims):
+    Z          -- atomic number, embedded into 6 dims via nn.Embedding(10, 6).
+    x, y, z    -- continuous coordinates, 3 dims.
+    ==> 9-dim node input.
+    node_mlp(9 -> 16 -> 32 -> 16 -> 8) -> node_dim = 8.
 
-    Default embedding widths give a 21-dim node input, fed to
-    node_mlp(21 -> 32 -> 64 -> 32 -> 16 -> 8) -> node_dim = 8.
+    Discrete chemistry features (hybridization, aromatic_flag, n_H) were
+    dropped in v3: SOTA chemistry GNNs (SchNet, DimeNet, PaiNN) use only
+    Z and let the MP stack derive bonding patterns from geometry.
 
-Edge features per bond (i -> j):
-    vec3  : up to 3 bond angles  angle(k - i - j) at source atom i, padded
-            with zeros to length 3.
-    vec4  : up to 9 unsigned dihedrals  dih(k - i - j - l) at edge (i, j),
-            padded with zeros to length 9.
-    dist  : bond distance in Angstroms.
-    ==> 13-dim raw edge input.
-    edge_mlp(13 -> 6 -> 8 -> 16 -> 8 -> 3) -> 3 learned edge dims.
+Edge features per bond (i -> j), 28 dims raw:
+    vec3   : up to 3 bond angles angle(k - i - j) at source atom i, padded
+             with zeros to length 3.
+    vec4   : up to 9 unsigned dihedrals dih(k - i - j - l) at edge (i, j),
+             padded with zeros to length 9.
+    rbf(d) : 16-dim Gaussian Radial Basis Function expansion of the bond
+             distance. Replaces the scalar distance from v2. Each output
+             dim answers "how close is d to one of 16 reference distances
+             between 0 and 5 Angstroms?", giving the MLP localized,
+             distance-regime-specific features (single bond, double bond,
+             1,3 contact, etc.) instead of one raw scalar.
+    ==> 28-dim raw edge input.
+    edge_mlp(28 -> 16 -> 16 -> 8 -> 3) -> 3 learned edge dims.
 
-    Bond type is a discrete field (0=padding, 1=single, 2=double,
-    3=triple, 4=aromatic). It enters as a learned **multiplicative
-    embedding vector**:
-        edge_out = bond_embed(bond_type) * edge_mlp(vec3, vec4, dist)
-    bond_embed has output dim equal to edge_mlp's output (3 by default),
-    so the multiply is element-wise.
+    Bond type is no longer used (dropped in v3 alongside the chemistry
+    fields).
 
 Message passing: 6 x InvariantMP with sum aggregation and residual,
 operating in 8-dim node space with 3-dim edge features. Pooling is
@@ -65,26 +68,19 @@ _POOLINGS = {
 }
 
 # Column indices into the 9-dim HDF5 node feature vector
-# (see data_processors/h5_maker_qm9.py for the layout).
+# (see data_processors/h5_maker_qm9.py for the layout). v3 only consumes
+# Z and the xyz coordinates; the other discrete fields are dropped.
 _Z_COL = 0           # atomic number, integer in {1, 6, 7, 8, 9}
-_AROM_COL = 1        # aromatic flag, integer in {0, 1}
-_HYB_COL = 2         # hybridization, integer in {0=none, 1=SP, 2=SP2, 3=SP3}
-_NH_COL = 3          # attached hydrogen count, integer in {0, 1, 2, 3, 4}
 _COORD_COLS = slice(4, 7)
 
-# Vocabulary sizes for the discrete -> continuous embeddings. Bumped a bit
-# above the actual max so accidental out-of-range values fail loudly via
-# IndexError instead of silently aliasing.
-_VOCAB_Z = 10        # Z up to 9 in CHNOF
-_VOCAB_HYB = 4       # 0..3
-_VOCAB_AROM = 2      # 0/1
-_VOCAB_NH = 5        # 0..4
-_VOCAB_BOND = 5      # 0=padding, 1=single, 2=double, 3=triple, 4=aromatic
+# Vocabulary size for atomic-number embedding. Bumped a bit above the
+# actual max (9 for fluorine) so accidental out-of-range values fail loudly
+# via IndexError instead of silently aliasing.
+_VOCAB_Z = 10
 
-# Column indices into the 4-dim HDF5 edge feature vector: bond_type is [0],
-# distance is [3] (theta, phi at [1], [2] are not used; we recompute geometry
-# from coords for the richer vector-valued bond/dihedral features).
-_BOND_TYPE_COL = 0
+# Column index into the 4-dim HDF5 edge feature vector: distance is [3]
+# (theta, phi at [1], [2] are not used; geometry is recomputed from coords).
+# Bond type at [0] is not consumed by v3.
 _DISTANCE_COL = 3
 
 # Pad-to-max sizes for the edge angle vectors. Values match the physical
@@ -292,26 +288,51 @@ def compute_dihedral_vec(
     return out
 
 
+def gaussian_rbf(
+    d: torch.Tensor,
+    centers: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """
+    Gaussian Radial Basis Function expansion:  exp(-gamma * (d - mu_k)^2).
+
+    Maps each scalar distance to a localized basis vector whose entries
+    indicate "how close is d to each of K reference distances mu_k". This
+    gives downstream linear layers distance-regime-specific features
+    (single bond, double bond, 1,3 contact, etc.) instead of forcing them
+    to decode meaning from one raw scalar.
+
+    Args:
+        d:       (E,) edge distances in Angstroms.
+        centers: (K,) reference distances mu_k.
+        gamma:   width parameter.
+
+    Returns:
+        (E, K) RBF expansion.
+    """
+    return torch.exp(-gamma * (d.unsqueeze(-1) - centers) ** 2)
+
+
 def build_edge_raw_features(
     edge_attr_loader: torch.Tensor,
     coords: torch.Tensor,
     edge_index: torch.Tensor,
+    rbf_centers: torch.Tensor,
+    rbf_gamma: float,
     max_neighbors: int = MAX_NEIGHBORS,
     max_chains: int = MAX_CHAINS,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
-    Build the (E, 9)-dim raw edge features and the (E,) bond-type vector.
+    Build the (E, max_neighbors + max_chains + K)-dim raw edge features.
 
-    Raw features layout: [vec3_bond (MAX_NEIGHBORS) | vec4_dihedral (MAX_CHAINS) | distance (1)].
-    Bond type is returned separately because it enters the model as a
-    multiplicative scalar, not as an additive MLP input.
+    Raw features layout: [vec3_bond | vec4_dihedral | rbf(distance)]
+    K = len(rbf_centers).
     """
-    distance = edge_attr_loader[:, _DISTANCE_COL:_DISTANCE_COL + 1]
-    bond_type = edge_attr_loader[:, _BOND_TYPE_COL]
+    distance = edge_attr_loader[:, _DISTANCE_COL]                          # (E,)
+    rbf = gaussian_rbf(distance, rbf_centers, rbf_gamma)                   # (E, K)
     vec3 = compute_bond_angle_vec(coords, edge_index, max_neighbors)
     vec4 = compute_dihedral_vec(coords, edge_index, max_chains)
-    raw = torch.cat([vec3, vec4, distance], dim=-1)
-    return raw, bond_type
+    return torch.cat([vec3, vec4, rbf], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +394,9 @@ def _build_mlp(dims: Tuple[int, ...]) -> nn.Sequential:
 
 class GNN(nn.Module):
     """
-    Baseline GNN with discrete-field embeddings for node features
-    (Z, hybridization, aromatic, n_H) plus 3D coordinates, and a learned
-    bond-type multiplier on the geometric edge features.
+    SOTA-flavored compact GNN: only atomic number is embedded on nodes,
+    bond-distance is encoded as a Gaussian RBF basis, and bond type / other
+    chemistry annotations are dropped (left to be learned implicitly).
     """
 
     DEFAULT_TARGET_INDEX = 4           # PyG QM9 layout: 4 = HOMO-LUMO gap (eV)
@@ -383,60 +404,57 @@ class GNN(nn.Module):
     def __init__(
         self,
         num_mp_layers: int = 6,
-        embed_z_dim: int = 6,
-        embed_hyb_dim: int = 4,
-        embed_arom_dim: int = 4,
-        embed_nH_dim: int = 4,
-        node_mlp_dims: Tuple[int, ...] = (21, 32, 64, 32, 16, 8),
-        edge_mlp_dims: Tuple[int, ...] = (13, 6, 8, 16, 8, 3),
+        embed_z_dim: int = 16,
+        node_mlp_dims: Tuple[int, ...] = (19, 32, 64, 64, 32),
+        edge_mlp_dims: Tuple[int, ...] = (28, 32, 32, 16, 8),
         max_neighbors: int = MAX_NEIGHBORS,
         max_chains: int = MAX_CHAINS,
+        rbf_num_centers: int = 16,
+        rbf_range: Tuple[float, float] = (0.0, 5.0),
+        rbf_gamma: float = 4.0,
         pooling: str = "mean",
     ):
         super().__init__()
         if pooling not in _POOLINGS:
             raise ValueError(f"pooling must be one of {list(_POOLINGS)}; got {pooling!r}")
-        expected_node_in = embed_z_dim + embed_hyb_dim + embed_arom_dim + embed_nH_dim + 3
+        expected_node_in = embed_z_dim + 3
         if node_mlp_dims[0] != expected_node_in:
             raise ValueError(
                 f"node_mlp_dims[0]={node_mlp_dims[0]} inconsistent with "
-                f"sum of embedding dims + 3 (xyz) = {expected_node_in}"
+                f"embed_z_dim + 3 (xyz) = {expected_node_in}"
             )
-        if edge_mlp_dims[0] != max_neighbors + max_chains + 1:
+        expected_edge_in = max_neighbors + max_chains + rbf_num_centers
+        if edge_mlp_dims[0] != expected_edge_in:
             raise ValueError(
                 f"edge_mlp_dims[0]={edge_mlp_dims[0]} inconsistent with "
-                f"max_neighbors+max_chains+1={max_neighbors + max_chains + 1}"
+                f"max_neighbors+max_chains+rbf_num_centers={expected_edge_in}"
             )
         self.max_neighbors = max_neighbors
         self.max_chains = max_chains
+        self.rbf_gamma = rbf_gamma
         self.node_dim = node_mlp_dims[-1]
         self.edge_dim = edge_mlp_dims[-1]
         self._pool = _POOLINGS[pooling]
 
-        # Discrete -> continuous embeddings for the categorical node fields.
-        # Each is a small lookup table; total embedding params are tiny.
+        # RBF reference distances. Stored as a buffer so they move with the
+        # model to GPU and travel with state_dict (the centers are fixed
+        # hyperparams, not learnable, but persisting them avoids a config
+        # mismatch when reloading checkpoints).
+        rbf_min, rbf_max = rbf_range
+        centers = torch.linspace(rbf_min, rbf_max, rbf_num_centers)
+        self.register_buffer("rbf_centers", centers)
+
+        # Atomic-number embedding: only discrete chemistry feature kept.
         self.embed_Z = nn.Embedding(_VOCAB_Z, embed_z_dim)
-        self.embed_hyb = nn.Embedding(_VOCAB_HYB, embed_hyb_dim)
-        self.embed_arom = nn.Embedding(_VOCAB_AROM, embed_arom_dim)
-        self.embed_nH = nn.Embedding(_VOCAB_NH, embed_nH_dim)
 
         self.node_mlp = _build_mlp(node_mlp_dims)
         self.edge_mlp = _build_mlp(edge_mlp_dims)
-
-        # Bond type is a discrete field. Each type gets a learned vector of
-        # the same width as edge_mlp's output, used as a multiplicative
-        # gate: edge_out = bond_embed(bond_type) * edge_mlp(...). This
-        # replaces the earlier alpha * bond_type scalar form, which forced
-        # an arithmetic ratio across types (e.g. double=2*single) that has
-        # no chemical justification (especially for type=4 aromatic).
-        self.bond_embed = nn.Embedding(_VOCAB_BOND, self.edge_dim)
 
         self.mp_layers = nn.ModuleList(
             [InvariantMP(self.node_dim, self.edge_dim) for _ in range(num_mp_layers)]
         )
 
-        # Readout: node_dim -> 32 -> 1. Wider than before to match the
-        # wider node space (8 instead of 4).
+        # Readout: node_dim -> 32 -> 1.
         self.readout = nn.Sequential(
             nn.Linear(self.node_dim, 32),
             nn.ReLU(),
@@ -497,24 +515,14 @@ class GNN(nn.Module):
 
     def build_node_feat(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Build the per-atom continuous representation by looking up each
-        discrete field in its embedding and concatenating with xyz.
+        Build the per-atom continuous representation: Z embedded, then
+        concatenated with xyz coordinates.
 
-        Returns (N, embed_z_dim + embed_hyb_dim + embed_arom_dim +
-                 embed_nH_dim + 3).
+        Returns (N, embed_z_dim + 3).
         """
         Z = x[:, _Z_COL].long()
-        hyb = x[:, _HYB_COL].long()
-        arom = x[:, _AROM_COL].long()
-        nH = x[:, _NH_COL].long()
         coords = x[:, _COORD_COLS]
-        return torch.cat([
-            self.embed_Z(Z),
-            self.embed_hyb(hyb),
-            self.embed_arom(arom),
-            self.embed_nH(nH),
-            coords,
-        ], dim=-1)
+        return torch.cat([self.embed_Z(Z), coords], dim=-1)
 
     def build_edge_feat(
         self,
@@ -524,15 +532,12 @@ class GNN(nn.Module):
     ) -> torch.Tensor:
         """Compute the 3-dim geometry-only edge feature used in MP."""
         coords = x[:, _COORD_COLS]
-        raw, bond_type = build_edge_raw_features(
+        raw = build_edge_raw_features(
             edge_attr_loader, coords, edge_index,
+            rbf_centers=self.rbf_centers, rbf_gamma=self.rbf_gamma,
             max_neighbors=self.max_neighbors, max_chains=self.max_chains,
         )
-        e = self.edge_mlp(raw)                                    # (E, edge_dim)
-        # Element-wise multiply by the bond-type embedding vector. Each of
-        # the 5 bond types (incl. padding=0) gets its own learned gate.
-        e = self.bond_embed(bond_type.long()) * e
-        return e
+        return self.edge_mlp(raw)
 
     # --- forward ----------------------------------------------------------
 
