@@ -127,6 +127,8 @@ class QM9GraphDataset(Dataset):
         h5_path: str,
         target_keys: List[str],
         qfim_shape: Optional[Tuple[int, int]] = None,
+        target_mean: Optional[Sequence[float]] = None,
+        target_std: Optional[Sequence[float]] = None,
     ) -> None:
         """
         Args:
@@ -134,11 +136,35 @@ class QM9GraphDataset(Dataset):
             target_keys: Subset of TARGET_IDX to predict.
             qfim_shape:  (n_qubits, per_qubit_dim) to slice the in-file qfim
                          rot-gate block. Required to enable QFIM features.
+            target_mean: Train-split mean for selected targets.
+            target_std:  Train-split std for selected targets.
         """
         self.h5_path = str(h5_path)
         self.target_indices = _resolve_target_indices(target_keys)
         self.qfim_shape = qfim_shape
-        
+        self.target_mean = (
+            np.asarray(target_mean, dtype=np.float32).reshape(-1)
+            if target_mean is not None
+            else None
+        )
+        self.target_std = (
+            np.asarray(target_std, dtype=np.float32).reshape(-1)
+            if target_std is not None
+            else None
+        )
+        if (self.target_mean is None) != (self.target_std is None):
+            raise ValueError("target_mean and target_std must be provided together.")
+        if self.target_mean is not None:
+            n_targets = len(self.target_indices)
+            if (
+                self.target_mean.shape != (n_targets,)
+                or self.target_std.shape != (n_targets,)
+            ):
+                raise ValueError(
+                    "target_mean and target_std must match the selected target count."
+                )
+            if np.any(self.target_std < 1e-8):
+                raise ValueError("target_std is ~0 for at least one selected target.")
 
         with h5py.File(self.h5_path, "r") as f:
             self.n_samples = int(f["node_features"].shape[0])
@@ -193,6 +219,8 @@ class QM9GraphDataset(Dataset):
             target = raw_target.reshape(1)
         else:
             target = raw_target[self.target_indices]
+        if self.target_mean is not None and self.target_std is not None:
+            target = (target - self.target_mean) / self.target_std
 
         nodes_t = torch.from_numpy(np.asarray(nodes, dtype=np.float32))
         edges_t = torch.from_numpy(np.asarray(edges, dtype=np.float32))
@@ -202,17 +230,7 @@ class QM9GraphDataset(Dataset):
         bond_mask = edges_t[..., 0] > 0                                       # (H, H)
         edge_idx = bond_mask.nonzero(as_tuple=False).t().contiguous()         # (2, E)
         edge_attr = edges_t[bond_mask]                                        # (E, 4)
-        #------------- ------------- ------------- ------------- ------------- ------------- 
-        #Item                         | Used? | How
-        #-----------------------------|-------|--------------------------------------------
-        #Hydrogen as graph node        | No    | Loader slices only first n_heavy atoms
-        #Hydrogen bonds/edges          | No    | Edges are sliced to [:n_heavy, :n_heavy]
-        #Attached hydrogen count       | Yes   | Node feature column 3: num_attached_hydrogens
-        #Total atom count incl. H      | Yes   | Node feature column 7: n_atoms_total
-        #Heavy atom count              | Yes   | Node feature column 8: n_heavy_atoms
-        #QFIM for hydrogen atoms       | No    | QFIM is used for heavy-atom/qubit block only
 
-        #------------- ------------- ------------- ------------- ------------- ------------- 
         data = Data(
             x=nodes_t,
             edge_index=edge_idx.long(),
@@ -261,6 +279,8 @@ def build_loader(
     shuffle: bool,
     num_workers: int = 4,
     qfim_shape: Optional[Tuple[int, int]] = None,
+    target_mean: Optional[Sequence[float]] = None,
+    target_std: Optional[Sequence[float]] = None,
     max_samples: Optional[int] = None,
     seed: int = 42,
     pin_memory: bool = True,
@@ -270,6 +290,8 @@ def build_loader(
         h5_path=h5_path,
         target_keys=target_keys,
         qfim_shape=qfim_shape,
+        target_mean=target_mean,
+        target_std=target_std,
     )
     if max_samples is not None and max_samples < len(dataset):
         rng = np.random.default_rng(seed)
@@ -308,14 +330,15 @@ def build_loaders_from_config(config: Any) -> Any:
     if qfim_cfg is not None:
         qfim_shape = (int(qfim_cfg.n_qubits), int(qfim_cfg.per_qubit_dim))
 
-    def _attach_train_target_stats(loader: DataLoader) -> None:
-        mean, std, count = target_stats_for_keys(
-            config.paths.train,
-            target_keys=target_keys,
-        )
-        loader.target_mean = mean
-        loader.target_std = std
-        loader.target_stats_count = count
+    target_mean, target_std, target_count = target_stats_for_keys(
+        config.paths.train,
+        target_keys=target_keys,
+    )
+
+    def _attach_target_stats(loader: DataLoader) -> None:
+        loader.target_mean = target_mean
+        loader.target_std = target_std
+        loader.target_stats_count = target_count
 
     if config.setup.train:
         train_loader = build_loader(
@@ -325,10 +348,12 @@ def build_loaders_from_config(config: Any) -> Any:
             shuffle=shuffle,
             num_workers=num_workers,
             qfim_shape=qfim_shape,
+            target_mean=target_mean,
+            target_std=target_std,
             max_samples=getattr(config.setup, "train_n", None),
             seed=seed,
         )
-        _attach_train_target_stats(train_loader)
+        _attach_target_stats(train_loader)
         val_loader = build_loader(
             h5_path=config.paths.val,
             target_keys=target_keys,
@@ -336,12 +361,12 @@ def build_loaders_from_config(config: Any) -> Any:
             shuffle=False,
             num_workers=num_workers,
             qfim_shape=qfim_shape,
+            target_mean=target_mean,
+            target_std=target_std,
             max_samples=getattr(config.setup, "val_n", None),
             seed=seed,
         )
-        val_loader.target_mean = train_loader.target_mean
-        val_loader.target_std = train_loader.target_std
-        val_loader.target_stats_count = train_loader.target_stats_count
+        _attach_target_stats(val_loader)
         logger.info(
             f"train batches={len(train_loader)} | val batches={len(val_loader)}"
         )
@@ -354,9 +379,11 @@ def build_loaders_from_config(config: Any) -> Any:
         shuffle=False,
         num_workers=num_workers,
         qfim_shape=qfim_shape,
+        target_mean=target_mean,
+        target_std=target_std,
         max_samples=getattr(config.setup, "test_n", None),
         seed=seed,
     )
-    _attach_train_target_stats(test_loader)
+    _attach_target_stats(test_loader)
     logger.info(f"test batches={len(test_loader)}")
     return test_loader
