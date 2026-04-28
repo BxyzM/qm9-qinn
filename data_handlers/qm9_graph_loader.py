@@ -31,8 +31,7 @@ Target indices follow the 19-dim QM9 target layout; resolved once in __init__.
 
 from __future__ import annotations
 
-import pathlib
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -49,12 +48,65 @@ TARGET_IDX: Tuple[str, ...] = (
     "rot_A", "rot_B", "rot_C",
 )
 
+TARGET_MEAN_ATTR = "target_mean"
+TARGET_STD_ATTR = "target_std"
+TARGET_COUNT_ATTR = "target_count"
+
 
 def _resolve_target_indices(keys: List[str]) -> List[int]:
     invalid = [k for k in keys if k not in TARGET_IDX]
     if invalid:
         raise ValueError(f"Unknown targets {invalid}. Valid: {list(TARGET_IDX)}")
     return [TARGET_IDX.index(k) for k in keys]
+
+
+def ensure_target_stats_metadata(h5_path: str) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Read target stats from HDF5 attrs, or compute and store them once."""
+    h5_path = str(h5_path)
+    attr_names = (TARGET_MEAN_ATTR, TARGET_STD_ATTR, TARGET_COUNT_ATTR)
+
+    with h5py.File(h5_path, "r") as f:
+        if all(name in f.attrs for name in attr_names):
+            mean = np.asarray(f.attrs[TARGET_MEAN_ATTR], dtype=np.float64)
+            std = np.asarray(f.attrs[TARGET_STD_ATTR], dtype=np.float64)
+            count = int(f.attrs[TARGET_COUNT_ATTR])
+            return mean, std, count
+
+    with h5py.File(h5_path, "r+") as f:
+        if all(name in f.attrs for name in attr_names):
+            mean = np.asarray(f.attrs[TARGET_MEAN_ATTR], dtype=np.float64)
+            std = np.asarray(f.attrs[TARGET_STD_ATTR], dtype=np.float64)
+            count = int(f.attrs[TARGET_COUNT_ATTR])
+            return mean, std, count
+
+        targets = np.asarray(f["targets"], dtype=np.float64)
+        if targets.ndim == 1:
+            targets = targets[:, None]
+        if targets.shape[0] < 2:
+            raise RuntimeError(
+                f"Target stats need >= 2 samples; got {targets.shape[0]}."
+            )
+
+        mean = targets.mean(axis=0)
+        std = targets.std(axis=0, ddof=1)
+        count = int(targets.shape[0])
+        if np.any(std < 1e-8):
+            raise RuntimeError("Target std is ~0 for at least one target column.")
+
+        f.attrs[TARGET_MEAN_ATTR] = mean
+        f.attrs[TARGET_STD_ATTR] = std
+        f.attrs[TARGET_COUNT_ATTR] = count
+        logger.info(f"wrote target stats metadata | count={count} | path={h5_path}")
+        return mean, std, count
+
+
+def target_stats_for_keys(
+    h5_path: str,
+    target_keys: List[str],
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    mean, std, count = ensure_target_stats_metadata(h5_path)
+    indices = _resolve_target_indices(target_keys)
+    return mean[indices], std[indices], count
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -86,6 +138,7 @@ class QM9GraphDataset(Dataset):
         self.h5_path = str(h5_path)
         self.target_indices = _resolve_target_indices(target_keys)
         self.qfim_shape = qfim_shape
+        
 
         with h5py.File(self.h5_path, "r") as f:
             self.n_samples = int(f["node_features"].shape[0])
@@ -94,13 +147,13 @@ class QM9GraphDataset(Dataset):
             self._qfim_in_h5 = "qfim" in f
 
         self._h5: Optional[h5py.File] = None
+        self._indices: Optional[np.ndarray] = None
 
         if self._qfim_in_h5 and self.qfim_shape is None:
-            # qfim present in the file but user did not request it -- ignore.
             self._qfim_in_h5 = False
-
         logger.info(
-            f"QM9GraphDataset: {self.n_samples} molecules | "
+            f"QM9GraphDataset: {len(self)} molecules"
+            f"{f' ({self.n_samples} raw)' if self._indices is not None else ''} | "
             f"node_dim={self.node_dim} | max_nodes={self.max_nodes} | "
             f"qfim={'yes' if self._qfim_in_h5 else 'no'} | path={self.h5_path}"
         )
@@ -118,10 +171,14 @@ class QM9GraphDataset(Dataset):
             self._h5 = h5py.File(self.h5_path, "r", libver="latest", swmr=True)
 
     def __len__(self) -> int:
+        if self._indices is not None:
+            return int(self._indices.shape[0])
         return self.n_samples
 
     def __getitem__(self, idx: int) -> Data:
         self._ensure_open()
+        if self._indices is not None:
+            idx = int(self._indices[idx])
 
         n_heavy = int(self._h5["n_atoms"][idx, 1])
         # Slice only the heavy-atom block; dense zeros beyond are padding.
@@ -145,7 +202,17 @@ class QM9GraphDataset(Dataset):
         bond_mask = edges_t[..., 0] > 0                                       # (H, H)
         edge_idx = bond_mask.nonzero(as_tuple=False).t().contiguous()         # (2, E)
         edge_attr = edges_t[bond_mask]                                        # (E, 4)
+        #------------- ------------- ------------- ------------- ------------- ------------- 
+        #Item                         | Used? | How
+        #-----------------------------|-------|--------------------------------------------
+        #Hydrogen as graph node        | No    | Loader slices only first n_heavy atoms
+        #Hydrogen bonds/edges          | No    | Edges are sliced to [:n_heavy, :n_heavy]
+        #Attached hydrogen count       | Yes   | Node feature column 3: num_attached_hydrogens
+        #Total atom count incl. H      | Yes   | Node feature column 7: n_atoms_total
+        #Heavy atom count              | Yes   | Node feature column 8: n_heavy_atoms
+        #QFIM for hydrogen atoms       | No    | QFIM is used for heavy-atom/qubit block only
 
+        #------------- ------------- ------------- ------------- ------------- ------------- 
         data = Data(
             x=nodes_t,
             edge_index=edge_idx.long(),
@@ -221,7 +288,6 @@ def build_loader(
         collate_fn=_collate,
     )
 
-
 def build_loaders_from_config(config: Any) -> Any:
     """
     Build train+val loaders (if config.setup.train) or test loader otherwise.
@@ -242,6 +308,15 @@ def build_loaders_from_config(config: Any) -> Any:
     if qfim_cfg is not None:
         qfim_shape = (int(qfim_cfg.n_qubits), int(qfim_cfg.per_qubit_dim))
 
+    def _attach_train_target_stats(loader: DataLoader) -> None:
+        mean, std, count = target_stats_for_keys(
+            config.paths.train,
+            target_keys=target_keys,
+        )
+        loader.target_mean = mean
+        loader.target_std = std
+        loader.target_stats_count = count
+
     if config.setup.train:
         train_loader = build_loader(
             h5_path=config.paths.train,
@@ -253,6 +328,7 @@ def build_loaders_from_config(config: Any) -> Any:
             max_samples=getattr(config.setup, "train_n", None),
             seed=seed,
         )
+        _attach_train_target_stats(train_loader)
         val_loader = build_loader(
             h5_path=config.paths.val,
             target_keys=target_keys,
@@ -263,6 +339,9 @@ def build_loaders_from_config(config: Any) -> Any:
             max_samples=getattr(config.setup, "val_n", None),
             seed=seed,
         )
+        val_loader.target_mean = train_loader.target_mean
+        val_loader.target_std = train_loader.target_std
+        val_loader.target_stats_count = train_loader.target_stats_count
         logger.info(
             f"train batches={len(train_loader)} | val batches={len(val_loader)}"
         )
@@ -278,5 +357,6 @@ def build_loaders_from_config(config: Any) -> Any:
         max_samples=getattr(config.setup, "test_n", None),
         seed=seed,
     )
+    _attach_train_target_stats(test_loader)
     logger.info(f"test batches={len(test_loader)}")
     return test_loader
