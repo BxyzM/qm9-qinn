@@ -34,9 +34,8 @@ configurable (mean / max / add); mean is appropriate for intensive
 targets like the HOMO-LUMO gap.
 
 Target standardization:
-    Stats fit once via model.fit_target_stats(train_loader) before training.
-    Buffers (target_mean, target_std) travel with state_dict so checkpoints
-    keep consistent normalization.
+    The dataloader standardizes targets with train-split HDF5 metadata.
+    The model predicts standardized targets directly.
 
 Permutation note:
     Angles/dihedrals are kept as fixed-length vectors in loader order, not
@@ -48,7 +47,7 @@ Permutation note:
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -569,56 +568,6 @@ class GNN(nn.Module):
             nn.Linear(32, 1),
         )
 
-        self.register_buffer("target_mean", torch.zeros(1))
-        self.register_buffer("target_std", torch.ones(1))
-        self.register_buffer("_stats_fitted", torch.tensor(False))
-
-    # --- target stats ------------------------------------------------------
-
-    @torch.no_grad()
-    def fit_target_stats(
-        self,
-        loader: Iterable,
-        target_index: Optional[int] = None,
-    ) -> Tuple[float, float]:
-        if target_index is None:
-            target_index = self.DEFAULT_TARGET_INDEX
-
-        count = 0
-        mean = 0.0
-        m2 = 0.0
-        for batch in loader:
-            y = batch.y
-            if y.dim() > 1:
-                y = y[:, target_index]
-            y = y.flatten().double()
-            n_b = y.numel()
-            if n_b == 0:
-                continue
-            mean_b = y.mean().item()
-            m2_b = ((y - mean_b) ** 2).sum().item()
-            delta = mean_b - mean
-            new_count = count + n_b
-            mean = mean + delta * n_b / new_count
-            m2 = m2 + m2_b + delta ** 2 * count * n_b / new_count
-            count = new_count
-
-        if count < 2:
-            raise RuntimeError(f"fit_target_stats needs >= 2 samples; got {count}.")
-        std = (m2 / (count - 1)) ** 0.5
-        if std < 1e-8:
-            raise RuntimeError(f"Target std ~0 ({std:.2e}); check target_index.")
-
-        device = self.target_mean.device
-        self.target_mean.copy_(torch.tensor([mean], device=device))
-        self.target_std.copy_(torch.tensor([std], device=device))
-        self._stats_fitted.copy_(torch.tensor(True))
-        return float(mean), float(std)
-
-    @property
-    def stats_fitted(self) -> bool:
-        return bool(self._stats_fitted.item())
-
     # --- feature prep (reused by QFIMGNN) ---------------------------------
 
     def build_node_feat(self, x: torch.Tensor) -> torch.Tensor:
@@ -656,11 +605,6 @@ class GNN(nn.Module):
         edge_attr: torch.Tensor,
         batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not bool(self._stats_fitted.item()):
-            raise RuntimeError(
-                "GNN.forward called before fit_target_stats. "
-                "Call model.fit_target_stats(train_loader) once before training."
-            )
         if batch is None:
             batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
 
@@ -673,7 +617,7 @@ class GNN(nn.Module):
 
         g = self._pool_nodes(h, batch)                            # (B, pooled_dim)
         z = self.readout(g).squeeze(-1)                           # (B,)
-        return z * self.target_std + self.target_mean
+        return z
 
     def _pool_nodes(self, h: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
         if self.pooling == "mean_max":
