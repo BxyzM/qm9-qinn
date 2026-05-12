@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_qfim_v36_mlp"         # v36 baseline + QFIM MLP head
+  run_id: "gnn_qfim_bond_attn"
   train: true
   batch_size: 256
   epochs: 100
@@ -15,21 +15,19 @@ setup:
   early_stop_patience: 20
 
 model:
-  type: "gnn_qfim"
+  type: "gnn_qfim_bond_attn"
   num_layers: 6
   pooling: "mean_max"
   activation: "silu"
   mlp_residual: true
   msg_layers: 2
-  per_layer_edge_update: true
+  per_layer_edge_update: false   # not used by attn
 
 qfim:
   n_qubits: 10
-  per_qubit_dim: 6        # bioQINN: num_layers (2) * ops_per_layer (3)
-  drop_zero_rows: false    # do not infer missing QFIM from zero values alone
-  embed_op: "mlp"         # one of: mlp | conv1d | conv2d | gated
-  out_dim: 4              # qfim feature width per edge
-  head_normalize: true    # output LayerNorm on the head (mlp/gated only)
+  per_qubit_dim: 6
+  drop_zero_rows: false
+  attn_beta_init: 1.0            # learnable temperature on coupling -> attention
 
 optimizer:
   name: "adam"
@@ -50,4 +48,4 @@ paths:
   train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/train/qm9_train_with_qfim_no_bioqinn_overlap.h5"
   val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/val/qm9_val_with_qfim_no_bioqinn_overlap.h5"
   test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/test/qm9_test_with_qfim_no_bioqinn_overlap.h5"
-  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim_attn"

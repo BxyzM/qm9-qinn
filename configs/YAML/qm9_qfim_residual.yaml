@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_v37_mae"
+  run_id: "gnn_qfim_residual_fullconv_v37"
   train: true
   batch_size: 256
   epochs: 100
@@ -12,12 +12,23 @@ setup:
   val_n: null
   test_n: null
   save_every_epoch: true
-  early_stop_patience: 10
+  early_stop_patience: 5
+  early_stop_min_delta_mev: 15.0
 
 model:
-  type: "gnn"
-  num_layers: 6           # message-passing depth
-  pooling: "max"         # intensive target -> mean over per-atom outputs
+  type: "gnn_qfim_residual"
+  num_layers: 6
+  pooling: "max"
+
+qfim:
+  n_qubits: 10
+  per_qubit_dim: 6
+  drop_zero_rows: false
+  embed_op: "full_conv2d"
+  out_dim: 16
+  full_conv_channels: 16
+  full_conv_kernel: 9
+  residual_gate_init: 0.0
 
 optimizer:
   name: "adam"
@@ -33,4 +44,4 @@ paths:
   train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/train/qm9_train_with_qfim_no_bioqinn_overlap.h5"
   val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/val/qm9_val_with_qfim_no_bioqinn_overlap.h5"
   test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/test/qm9_test_with_qfim_no_bioqinn_overlap.h5"
-  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim_residual"

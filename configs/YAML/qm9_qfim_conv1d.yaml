@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_qfim_conv1d"
+  run_id: "gnn_qfim_v36_conv1d"
   train: true
   batch_size: 256
   epochs: 100
@@ -11,33 +11,43 @@ setup:
   train_n: null
   val_n: null
   test_n: null
-  save_every_epoch: false
-  early_stop_patience: 10
+  save_every_epoch: true
+  early_stop_patience: 20
 
 model:
   type: "gnn_qfim"
-  num_layers: 6           # message-passing depth
-  pooling: "mean"
+  num_layers: 6
+  pooling: "mean_max"
+  activation: "silu"
+  mlp_residual: true
+  msg_layers: 2
+  per_layer_edge_update: true
 
 qfim:
   n_qubits: 10
   per_qubit_dim: 6        # bioQINN: num_layers (2) * ops_per_layer (3)
+  drop_zero_rows: false
   embed_op: "conv1d"      # one of: mlp | conv1d | conv2d | gated
-  out_dim: 4              # qfim feature width per edge
+  out_dim: 4
+  head_normalize: false   # conv heads have output LayerNorm built in; flag is no-op here
 
 optimizer:
   name: "adam"
   lr: 1.0e-3
-  decay_factor: 0.5
-  decay_patience: 5
-  decay_threshold: 1.0e-4
+  schedule: "cosine"
+  warmup_epochs: 5
+  min_lr: 1.0e-5
 
 loss:
   name: "huber"
   delta: 0.1
 
+exclude_bioqinn:
+  enabled: false
+  qfim_root: "/work/mbinder/bioqinn/saved_models/run_005/qfim_parallel"
+
 paths:
-  train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
-  val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
-  test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
+  train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/train/qm9_train_with_qfim_no_bioqinn_overlap.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/val/qm9_val_with_qfim_no_bioqinn_overlap.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/test/qm9_test_with_qfim_no_bioqinn_overlap.h5"
   model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim"

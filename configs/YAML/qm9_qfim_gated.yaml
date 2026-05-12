@@ -22,6 +22,7 @@ model:
 qfim:
   n_qubits: 10
   per_qubit_dim: 6        # bioQINN: num_layers (2) * ops_per_layer (3)
+  drop_zero_rows: false    # do not infer missing QFIM from zero values alone
   embed_op: "gated"       # one of: mlp | conv1d | conv2d | gated
   out_dim: 4              # qfim feature width per edge
 
@@ -36,8 +37,12 @@ loss:
   name: "huber"
   delta: 0.1
 
+exclude_bioqinn:
+  enabled: false
+  qfim_root: "/work/mbinder/bioqinn/saved_models/run_005/qfim_parallel"
+
 paths:
-  train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
-  val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
-  test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
+  train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/train/qm9_train_with_qfim_no_bioqinn_overlap.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/val/qm9_val_with_qfim_no_bioqinn_overlap.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/test/qm9_test_with_qfim_no_bioqinn_overlap.h5"
   model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn_qfim"

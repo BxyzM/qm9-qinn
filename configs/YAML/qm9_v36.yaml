@@ -35,7 +35,7 @@ loss:
   delta: 0.1
 
 paths:
-  train: "/ceph/mbinder/bioqinn/classical/data/train/qm9_train_with_qfim.h5"
-  val:   "/ceph/mbinder/bioqinn/classical/data/val/qm9_val_with_qfim.h5"
-  test:  "/ceph/mbinder/bioqinn/classical/data/test/qm9_test_with_qfim.h5"
+  train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/train/qm9_train_with_qfim_no_bioqinn_overlap.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/val/qm9_val_with_qfim_no_bioqinn_overlap.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/test/qm9_test_with_qfim_no_bioqinn_overlap.h5"
   model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/gnn"

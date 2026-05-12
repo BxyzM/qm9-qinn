@@ -1,5 +1,5 @@
 setup:
-  run_id: "gnn_qfim_v36_mlp"         # v36 baseline + QFIM MLP head
+  run_id: "gnn_qfim_v37_mlp"
   train: true
   batch_size: 256
   epochs: 100
@@ -12,39 +12,30 @@ setup:
   val_n: null
   test_n: null
   save_every_epoch: true
-  early_stop_patience: 20
+  early_stop_patience: 10
 
 model:
   type: "gnn_qfim"
-  num_layers: 6
-  pooling: "mean_max"
-  activation: "silu"
-  mlp_residual: true
-  msg_layers: 2
-  per_layer_edge_update: true
+  num_layers: 6           # message-passing depth
+  pooling: "max"          # match v37 baseline
 
 qfim:
   n_qubits: 10
   per_qubit_dim: 6        # bioQINN: num_layers (2) * ops_per_layer (3)
-  drop_zero_rows: false    # do not infer missing QFIM from zero values alone
-  embed_op: "mlp"         # one of: mlp | conv1d | conv2d | gated
-  out_dim: 4              # qfim feature width per edge
-  head_normalize: true    # output LayerNorm on the head (mlp/gated only)
+  embed_op: "mlp"
+  out_dim: 4
+  head_normalize: true    # output LayerNorm on the MLP head — fixes the
+                          # noisy-channel issue v36 confirmed earlier.
 
 optimizer:
   name: "adam"
   lr: 1.0e-3
-  schedule: "cosine"
-  warmup_epochs: 5
-  min_lr: 1.0e-5
+  decay_factor: 0.5
+  decay_patience: 5
+  decay_threshold: 1.0e-4
 
 loss:
-  name: "huber"
-  delta: 0.1
-
-exclude_bioqinn:
-  enabled: false
-  qfim_root: "/work/mbinder/bioqinn/saved_models/run_005/qfim_parallel"
+  name: "mae"
 
 paths:
   train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/train/qm9_train_with_qfim_no_bioqinn_overlap.h5"

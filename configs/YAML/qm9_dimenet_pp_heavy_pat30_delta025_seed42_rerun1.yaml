@@ -1,0 +1,54 @@
+setup:
+  run_id: "dimenet_pp_heavy_pat30_delta025_seed42_rerun1"
+  train: true
+  batch_size: 128
+  epochs: 300
+  shuffle: true
+  num_workers: 1
+  targets:
+    - "gap"
+  convert_pnp: false
+  seed: 42
+  train_n: null
+  val_n: null
+  test_n: null
+  save_every_epoch: true
+  early_stop_patience: 30
+  early_stop_min_delta_mev: 0.25
+
+data:
+  use_all_atoms: false
+
+model:
+  type: "dimenet_pp"
+  hidden_channels: 128
+  out_channels: 1
+  num_blocks: 4
+  int_emb_size: 64
+  basis_emb_size: 8
+  out_emb_channels: 256
+  num_spherical: 7
+  num_radial: 6
+  cutoff: 5.0
+  max_num_neighbors: 32
+  envelope_exponent: 5
+  num_before_skip: 1
+  num_after_skip: 2
+  num_output_layers: 3
+  act: "swish"
+  output_initializer: "zeros"
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-3
+  weight_decay: 0.0
+  schedule: "none"
+
+loss:
+  name: "mae"
+
+paths:
+  train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/train/qm9_train_with_qfim_no_bioqinn_overlap.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/val/qm9_val_with_qfim_no_bioqinn_overlap.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed/test/qm9_test_with_qfim_no_bioqinn_overlap.h5"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/dimenet_pp"
