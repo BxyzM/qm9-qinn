@@ -1,6 +1,6 @@
 # GNN models for QM9 property prediction
 
-This folder contains three graph neural networks, all sharing a common
+This folder contains the QM9 graph neural networks, all sharing a common
 loader, training script, and inference script. Select between them with
 `model.type` in the YAML config.
 
@@ -8,11 +8,13 @@ loader, training script, and inference script. Select between them with
 
 | File | `model.type` | Notes |
 |---|---|---|
-| [gnn.py](gnn.py) | `gnn` | Plain message-passing baseline. Uses raw edge features `[bond_type, theta, phi, distance]`. **Not rotation invariant.** Lower-bound baseline. |
-| [gnn_invariant.py](gnn_invariant.py) | `gnn_invariant` | Rotation- and translation-invariant. Replaces lab-frame theta/phi with vectorized bond angles (3-bond) and optional dihedral angles (4-bond), computed on-device via `torch_scatter`. |
-| [gnn_qfim.py](gnn_qfim.py) | `gnn_qfim` | Invariant geometric edges + **per-edge QFIM coupling features**: the (pd, pd) off-diagonal rot-gate sub-block linking qubit-i's and qubit-j's rotation parameters is flattened and concatenated to each edge feature. Pure EdgeConv; QFIM never enters node features. |
+| [gnn.py](gnn.py) | `gnn` | Compact message-passing baseline. |
+| [gnn_qfim.py](gnn_qfim.py) | `gnn_qfim` | Baseline GNN with per-edge QFIM features. |
+| [gnn_qfim_attn.py](gnn_qfim_attn.py) | `gnn_qfim_attn`, `gnn_qfim_bond_attn`, `gnn_qfim_bond_gate` | QFIM attention/gating variants. |
+| [gnn_qfim_residual.py](gnn_qfim_residual.py) | `gnn_qfim_residual` | Residual QFIM message-rescaling GNN. |
+| [dimenet/](dimenet/) | `dimenet_pp`, `dimenet_pp_qfim` | DimeNet++ baseline and QFIM edge-state rescaling model used for the paper. |
 
-All three share:
+The compact GNN variants share:
 - Node features: 9D (atomic number, aromatic, hybridisation, n_H, x, y, z, n_atoms, n_heavy).
 - 6 message-passing layers, hidden dim 64 (configurable).
 - Global max pooling + 2-layer MLP readout.
@@ -36,13 +38,137 @@ Key properties:
 
 ```bash
 # plain GNN baseline
-python -m networks.GNN.train --config configs/YAML/qm9_gnn.yaml  # set model.type: gnn
+python -m networks.GNN.train --config configs/YAML/qm9.yaml
 
-# invariant GNN (3-bond + 4-bond)
-python -m networks.GNN.train --config configs/YAML/qm9_gnn.yaml  # model.type: gnn_invariant
+# QFIM-enhanced GNN
+python -m networks.GNN.train --config configs/YAML/qm9_qfim.yaml
+```
 
-# QFIM-enhanced GNN (requires a qfim.*_path and qfim.n_qubits / qfim.per_qubit_dim)
-python -m networks.GNN.train --config configs/YAML/qm9_gnn.yaml  # model.type: gnn_qfim
+### DimeNet++ run005v2 config templates
+
+These templates match the corrected DimeNet++ runs used for the paper. Change
+`setup.run_id` and `setup.seed` for each repeat.
+
+Baseline DimeNet++:
+
+```yaml
+setup:
+  run_id: "dimenet_pp_heavy_pat30_delta025_run005v2_seed42"
+  train: true
+  batch_size: 128
+  epochs: 300
+  shuffle: true
+  num_workers: 1
+  targets: ["gap"]
+  seed: 42
+  train_n: null
+  val_n: null
+  test_n: null
+  save_every_epoch: true
+  early_stop_patience: 30
+  early_stop_min_delta_mev: 0.25
+
+data:
+  use_all_atoms: false
+
+model:
+  type: "dimenet_pp"
+  hidden_channels: 128
+  out_channels: 1
+  num_blocks: 4
+  int_emb_size: 64
+  basis_emb_size: 8
+  out_emb_channels: 256
+  num_spherical: 7
+  num_radial: 6
+  cutoff: 5.0
+  max_num_neighbors: 32
+  envelope_exponent: 5
+  num_before_skip: 1
+  num_after_skip: 2
+  num_output_layers: 3
+  act: "swish"
+  output_initializer: "zeros"
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-3
+  weight_decay: 0.0
+  schedule: "none"
+
+loss:
+  name: "mae"
+
+paths:
+  train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed_2/train/qm9_train_with_qfim_no_bioqinn_overlap_2.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed_2/val/qm9_val_with_qfim_no_bioqinn_overlap_2.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed_2/test/qm9_test_with_qfim_no_bioqinn_overlap_2.h5"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/dimenet_pp"
+```
+
+QFIM edge-state rescaling DimeNet++:
+
+```yaml
+setup:
+  run_id: "dimenet_pp_heavy_qfim_pat30_delta025_run005v2_seed42"
+  train: true
+  batch_size: 128
+  epochs: 300
+  shuffle: true
+  num_workers: 1
+  targets: ["gap"]
+  seed: 42
+  train_n: null
+  val_n: null
+  test_n: null
+  save_every_epoch: true
+  early_stop_patience: 30
+  early_stop_min_delta_mev: 0.25
+
+data:
+  use_all_atoms: false
+
+model:
+  type: "dimenet_pp_qfim"
+  hidden_channels: 128
+  out_channels: 1
+  num_blocks: 4
+  int_emb_size: 64
+  basis_emb_size: 8
+  out_emb_channels: 256
+  num_spherical: 7
+  num_radial: 6
+  cutoff: 5.0
+  max_num_neighbors: 32
+  envelope_exponent: 5
+  num_before_skip: 1
+  num_after_skip: 2
+  num_output_layers: 3
+  act: "swish"
+  output_initializer: "zeros"
+
+qfim:
+  n_qubits: 10
+  per_qubit_dim: 6
+  embed_op: "conv2d"
+  out_dim: 8
+  residual_gate_init: 0.0
+  rescale_beta: 1.0
+
+optimizer:
+  name: "adam"
+  lr: 1.0e-3
+  weight_decay: 0.0
+  schedule: "none"
+
+loss:
+  name: "mae"
+
+paths:
+  train: "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed_2/train/qm9_train_with_qfim_no_bioqinn_overlap_2.h5"
+  val:   "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed_2/val/qm9_val_with_qfim_no_bioqinn_overlap_2.h5"
+  test:  "/ceph/mbinder/bioqinn/classical/data_no_bioqinn_overlap_uncompressed_2/test/qm9_test_with_qfim_no_bioqinn_overlap_2.h5"
+  model_dir: "/ceph/mbinder/qm9-qinn/classical/saved_models/dimenet_pp_qfim"
 ```
 
 Artifacts are written to `paths.model_dir/<setup.run_id>/`:
@@ -54,8 +180,8 @@ Artifacts are written to `paths.model_dir/<setup.run_id>/`:
 
 ```bash
 python -m networks.GNN.infer \
-    --config  configs/YAML/qm9_gnn.yaml \
-    --weights /work/mbinder/bioqinn/saved_models/gnn/gnn_inv_001/best.pt \
+    --config  configs/YAML/qm9_dimenet_pp_heavy.yaml \
+    --weights /ceph/mbinder/qm9-qinn/classical/saved_models/dimenet_pp/<run_id>/best.pt \
     --out     predictions.npz
 ```
 
@@ -101,9 +227,11 @@ test_path` to `.npy` files of shape `(N, n_qubits * per_qubit_dim)`.
 
 - `setup.batch_size`, `setup.num_workers`, `setup.epochs`, `setup.targets` (list).
 - `setup.train_n / val_n / test_n` — optional subsample caps.
-- `model.type` ∈ {`gnn`, `gnn_invariant`, `gnn_qfim`}.
-- `model.hidden_dim`, `model.num_layers`, `model.include_dihedral`.
-- `qfim.*` — only required for `gnn_qfim`.
+- `model.type` ∈ {`gnn`, `gnn_qfim`, `gnn_qfim_attn`, `gnn_qfim_bond_attn`,
+  `gnn_qfim_bond_gate`, `gnn_qfim_residual`, `dimenet_pp`,
+  `dimenet_pp_qfim`}.
+- `model.*` — architecture-specific hyperparameters.
+- `qfim.*` — required for QFIM-enabled models.
 - `loss.name` ∈ {`huber`, `mse`, `mae`}, `loss.delta` for huber.
 - `optimizer.lr`, `optimizer.decay_factor`, `optimizer.decay_patience`.
 

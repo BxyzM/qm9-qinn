@@ -26,12 +26,12 @@ change.
 The QFIM diagonal sub-blocks Q[i, i] are not used here. PyG bond edges never
 have i == j, so the gather returns only off-diagonal sub-blocks by
 construction. If per-atom self-coupling is wanted later, it belongs in a
-node-level extension (see legacy/gnn_qfim_node.py for the earlier attempt).
+node-level extension rather than this edge-feature path.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -90,14 +90,23 @@ def _gather_edge_qfim(
 # ---------------------------------------------------------------------------
 
 class _QFIMHeadMLP(nn.Module):
-    """Expand-compress MLP: pd*pd -> 64 -> 32 -> 16 -> 8 -> out_dim."""
+    """Expand-compress MLP: pd*pd -> 64 -> 32 -> 16 -> 8 -> out_dim.
 
-    def __init__(self, pd: int, out_dim: int = 4):
+    With ``head_normalize=True``, applies a final LayerNorm(out_dim) to
+    keep the head's output on a stable scale -- matches the conv heads.
+    Default False preserves the original (unnormalised) behaviour.
+    """
+
+    def __init__(self, pd: int, out_dim: int = 4, head_normalize: bool = False):
         super().__init__()
         self.mlp = _build_mlp((pd * pd, 64, 32, 16, 8, out_dim))
+        self.out_norm = nn.LayerNorm(out_dim) if head_normalize else None
 
     def forward(self, qfim_edge: torch.Tensor) -> torch.Tensor:
-        return self.mlp(qfim_edge)
+        out = self.mlp(qfim_edge)
+        if self.out_norm is not None:
+            out = self.out_norm(out)
+        return out
 
 
 class _QFIMHeadConv1d(nn.Module):
@@ -161,9 +170,13 @@ class _QFIMHeadConv2d(nn.Module):
 
 
 class _QFIMHeadGated(nn.Module):
-    """C_ij = ||Q[i,j]||_F (scalar), tiny MLP to out_dim."""
+    """C_ij = ||Q[i,j]||_F (scalar), tiny MLP to out_dim.
 
-    def __init__(self, pd: int, out_dim: int = 4):
+    With ``head_normalize=True``, applies a final LayerNorm(out_dim).
+    Default False preserves original behaviour.
+    """
+
+    def __init__(self, pd: int, out_dim: int = 4, head_normalize: bool = False):
         super().__init__()
         self.pd = pd
         self.mlp = nn.Sequential(
@@ -171,12 +184,16 @@ class _QFIMHeadGated(nn.Module):
             nn.ReLU(),
             nn.Linear(8, out_dim),
         )
+        self.out_norm = nn.LayerNorm(out_dim) if head_normalize else None
 
     def forward(self, qfim_edge: torch.Tensor) -> torch.Tensor:
         E = qfim_edge.shape[0]
         Q = qfim_edge.view(E, self.pd, self.pd)
         cij = torch.linalg.matrix_norm(Q, ord="fro").unsqueeze(-1)  # (E, 1)
-        return self.mlp(cij)
+        out = self.mlp(cij)
+        if self.out_norm is not None:
+            out = self.out_norm(out)
+        return out
 
 
 _QFIM_HEADS = {
@@ -218,6 +235,7 @@ class QFIMGNN(GNN):
         qfim_per_qubit_dim: int = 6,
         qfim_embed_op: str = "mlp",
         qfim_out_dim: int = 4,
+        qfim_head_normalize: bool = False,
     ):
         super().__init__(
             num_mp_layers=num_mp_layers,
@@ -242,9 +260,12 @@ class QFIMGNN(GNN):
         self.qfim_pd = qfim_per_qubit_dim
         self.qfim_out_dim = qfim_out_dim
         self.qfim_embed_op = qfim_embed_op
-        self.qfim_head = _QFIM_HEADS[qfim_embed_op](
-            pd=qfim_per_qubit_dim, out_dim=qfim_out_dim,
-        )
+        # Only mlp/gated heads accept head_normalize; conv heads always have
+        # output LayerNorm built in.
+        head_kwargs = {"pd": qfim_per_qubit_dim, "out_dim": qfim_out_dim}
+        if qfim_embed_op in ("mlp", "gated"):
+            head_kwargs["head_normalize"] = bool(qfim_head_normalize)
+        self.qfim_head = _QFIM_HEADS[qfim_embed_op](**head_kwargs)
 
         # Rebuild MP stack with the new edge dim = geom 3 + qfim out dim.
         new_edge_dim = self.edge_dim + qfim_out_dim
@@ -267,11 +288,6 @@ class QFIMGNN(GNN):
         qfim_nq: int,
         batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not bool(self._stats_fitted.item()):
-            raise RuntimeError(
-                "QFIMGNN.forward called before fit_target_stats. "
-                "Call model.fit_target_stats(train_loader) once before training."
-            )
         if batch is None:
             batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
 
@@ -288,4 +304,4 @@ class QFIMGNN(GNN):
 
         g = self._pool_nodes(h, batch)                                # (B, pooled_dim)
         z = self.readout(g).squeeze(-1)                               # (B,)
-        return z * self.target_std + self.target_mean
+        return z
