@@ -48,8 +48,7 @@ qm9-qinn/
 │       ├── gnn_qfim.py            # baseline + QFIM edge head (4 swappable heads)
 │       ├── train.py               # unified training entry
 │       ├── probe_qfim_permutation.py  # alignment diagnostic
-│       ├── probe_qfim_reshape.py      # reshape-convention diagnostic
-│       └── legacy/                    # pre-refactor models (reference only, not dispatched)
+│       └── probe_qfim_reshape.py      # reshape-convention diagnostic
 └── plots/
     └── make_qfim_compare*.py      # comparison plots over saved_models/
 ```
@@ -107,8 +106,8 @@ sum-aggregated, residual. Operates in 8-dim node space.
 → `Linear(8, 32) → ReLU → Linear(32, 1)`. Mean is correct for intensive
 targets like the gap.
 
-**Target standardization**: `fit_target_stats(train_loader)` must run once
-before training. Stats live in state_dict buffers.
+**Target standardization**: the train HDF5 stores `target_mean`, `target_std`,
+and `target_count` attrs. The dataloader standardizes `y` before batching.
 
 <!-- ---------- changed (v3): param count smaller despite RBF (chemistry features dropped) ---------- -->
 ~3.7k parameters total (v1: 1.2k, v2: 7.5k, v3: 3.7k).
@@ -139,11 +138,188 @@ space). The QFIM head is swappable via config:
 | `gated`   | `C_ij = ‖Q[i,j]‖_F` scalar, tiny MLP projecting to 4 dims |
 
 Only off-diagonal QFIM sub-blocks are used (bond edges never have i = j).
-Diagonal self-coupling `Q[i, i]` is not consumed by any top-level model;
-a legacy `QFIMGNNNode` variant that adds it as a node feature lives under
-`networks/GNN/legacy/` for reference.
+Diagonal self-coupling `Q[i, i]` is not consumed by any top-level model.
 
 1.3k – 6.5k parameters depending on head.
+
+### `QFIMAttnGNN` — Option A: dense QFIM graph + attention (`gnn_qfim_attn.py`)
+
+A different way to use QFIM. Instead of concatenating QFIM as an edge
+feature, QFIM defines **both the graph topology and the attention
+weights** that scale messages.
+
+**Graph topology — dense, not bond-based.** The bond graph is replaced
+with a fully-connected directed graph over the qubit-budgeted atoms:
+every directed pair `(i, j)` with `i != j` and `i, j < qfim_nq` is an
+edge. Typical QM9 molecule (9 heavy atoms): bond graph ≈ 22 edges,
+dense graph = 72 edges. Atoms beyond the qubit budget have no edges.
+
+**Edge features — RBF distance only.** Bond angles and dihedrals do not
+extend naturally to non-bonded pairs, so they are dropped here. Each
+edge gets a 16-dim Gaussian RBF expansion of the Euclidean distance
+(centers in [0, 5] Å), projected through `Linear(16) → SiLU → LayerNorm`
+to a 16-dim learned edge representation.
+
+**Attention scores from QFIM coupling.**
+
+```
+C_ij  = ||Q[i, j]||_F                   # scalar per edge
+s_ij  = beta * C_ij                     # learnable temperature beta per layer
+α_ij  = softmax_dst( s_ij )             # GAT convention: incoming weights of i sum to 1
+m_ij  = msg_mlp( cat(h_i, h_j, e_ij) )  # 2-layer message MLP, same as v36
+h_i  := h_i + Σ_j α_ij * m_ij           # residual update
+```
+
+The Frobenius norm `C_ij` collapses each (6, 6) QFIM sub-block to one
+positive scalar — "how strongly are qubits i and j coupled?". The
+softmax over the destination's neighbours gives a unit-budget attention:
+each node redistributes a fixed amount of attention across its
+neighbours, with QFIM-strong neighbours getting more weight. Six MP
+layers, each with its own learnable `beta`, so different layers can
+sharpen attention differently.
+
+**Why this works (vs concat-on-edge).** The MLP / conv heads inject QFIM
+as one channel inside the edge-feature vector that the message MLP must
+learn to read alongside geometric features. They land at or near the v36
+baseline — QFIM as a feature is redundant with what geometry already
+encodes for bonded pairs. Option A is structurally different: it gives
+the model 1-hop access to non-bonded couplings (long-range pairs the
+bond graph would only reach after many MP hops) and uses QFIM to *weight*
+how loudly each pair speaks. On the no-bioQINN-overlap split this beats
+v36 baseline by ~7% (val MAE 0.108 vs 0.116 eV at 100 epochs).
+
+**Caveat / ablations.** Going from baseline to Option A changes two
+things simultaneously:
+1. graph topology (sparse bond → dense)
+2. aggregation rule (sum → QFIM-weighted softmax attention)
+
+To disambiguate which contributes:
+
+| Variant | `model.type` | Graph | Aggregation | Tests |
+|---|---|---|---|---|
+| Option A | `gnn_qfim_attn` (default) | dense | softmax(β·‖Q‖) | combined effect (current best) |
+| Option D | `gnn_qfim_bond_attn` | bond | softmax(β·‖Q‖) | QFIM weights only — at v36 baseline |
+| Uniform | `gnn_qfim_attn` with `qfim.attn_uniform: true` | dense | uniform 1/N_i | dense graph alone, no QFIM signal |
+
+Running all four tells the full story: Option D ≈ baseline says QFIM
+weights on the bond graph don't help. The Uniform run determines whether
+the dense graph alone carries Option A's lift, or whether QFIM coupling
+is genuinely doing work.
+
+**Config keys (under `qfim:`):**
+
+```yaml
+qfim:
+  per_qubit_dim: 6           # pd from bioQINN: num_layers * ops_per_layer
+  attn_beta_init: 1.0        # initial β; learned per layer
+  edge_dim: 16               # MP-layer edge-feature dim after RBF projection
+  attn_uniform: false        # true → ablation: uniform attention, no QFIM
+```
+
+~30k parameters (close to baseline). Plus 6 learnable `β` scalars (one
+per MP layer).
+
+------------------------- E ----------------
+
+### Option E: dense graph + multiplicative softplus gate
+
+Same `QFIMAttnGNN` architecture as Option A — same dense graph, same
+RBF-distance edges, same node path — but the message-weighting mechanism
+is changed from softmax-attention to a **multiplicative gate**:
+
+```
+g_ij = 1 + alpha * softplus( beta * C_ij - theta )
+m_ij = msg_mlp( cat(h_i, h_j, e_ij) )
+h_i := h_i + Σ_j  g_ij * m_ij           # NO softmax normalisation
+```
+
+with `alpha`, `beta`, `theta` learnable scalars per MP layer.
+
+**Why this is different from Option A.** Softmax forces incoming weights
+into each node to sum to 1: messages compete for a fixed budget, and
+the *magnitude* of QFIM coupling is discarded after normalisation. The
+gate keeps the magnitude — a node with 9 strongly-coupled neighbours
+receives ~9× the signal of a node with 1 strongly-coupled neighbour,
+which matches the physical intuition "more coupling -> stronger message".
+
+**Properties.**
+- `g_ij >= 1` always (softplus >= 0), so the gate can only amplify,
+  never suppress. QFIM-uninformative edges contribute exactly the
+  baseline message; QFIM-informative edges contribute extra.
+- Falls back to baseline gracefully: as `alpha -> 0`, `g_ij -> 1` for
+  every edge, and the model degenerates to "v36 architecture on the
+  dense graph with sum aggregation."
+- Bounded gradient through softplus -- stable training.
+
+**Config (under `qfim:`):**
+
+```yaml
+qfim:
+  gate_mode: "softplus_gate"
+  attn_beta_init: 1.0       # learnable scale on coupling
+  gate_alpha_init: 1.0      # learnable amplification factor (init 1.0)
+  gate_theta_init: 0.0      # learnable bias inside softplus (init 0.0)
+```
+
+**Run:**
+
+```bash
+python -m networks.GNN.train --config configs/YAML/qm9_qfim_attn_gate.yaml
+```
+
+--------------------------------------------
+
+------------------------- F ----------------
+
+### Option F: dense graph + raw multiplicative weight
+
+The simplest possible multiplicative form:
+
+```
+g_ij = beta * C_ij                       # no softplus, no offset, no clamp
+m_ij = msg_mlp( cat(h_i, h_j, e_ij) )
+h_i := h_i + Σ_j  g_ij * m_ij
+```
+
+Only one learnable scalar per MP layer (`beta`), no normalisation, no
+saturation. Each edge's contribution scales linearly with QFIM coupling.
+
+**Properties.**
+- Most direct test of the "high coupling → strong message" intuition.
+- Magnitude unbounded: `‖Q‖_F` varies across molecules, so the loss
+  landscape sees per-batch scale variation. Optimisation may be less
+  stable than Option E.
+- No clean fall-back to baseline: if QFIM is uninformative, the model
+  has to learn to drive `beta -> 0` to neutralise the gate, which
+  removes *all* messages -- not the same as the baseline path.
+
+**Config (under `qfim:`):**
+
+```yaml
+qfim:
+  gate_mode: "raw"
+  attn_beta_init: 1.0       # only learnable scalar; init at 1.0
+```
+
+**Run:**
+
+```bash
+python -m networks.GNN.train --config configs/YAML/qm9_qfim_attn_raw.yaml
+```
+
+--------------------------------------------
+
+The full `gate_mode` registry on `gnn_qfim_attn`:
+
+| `gate_mode`        | Form                                        | Sums to 1 | Bounded |
+|---|---|---|---|
+| `softmax`          | `softmax_dst(beta * C_ij)`                  | yes       | [0, 1]  |
+| `uniform`          | `1 / in_degree(dst)` (no QFIM)              | yes       | [0, 1]  |
+| `softplus_gate` (E) | `1 + alpha * softplus(beta * C_ij - theta)` | no        | [1, ∞)  |
+| `raw` (F)          | `beta * C_ij`                               | no        | unbounded |
+
+All four use the same dense QFIM-adjacency graph and the same RBF-distance
+edge features.
 
 ---
 
@@ -169,9 +345,9 @@ against a re-computed QFIM.
 ## Target and data
 
 Primary regression target is **HOMO-LUMO gap** (eV). Targets are
-standardized by the training split's mean/std; buffers live in the model
-and travel with `state_dict`, so val/test and checkpoint reloads always
-denormalize consistently.
+standardized in the dataloader by the training split's mean/std stored in
+the train HDF5 metadata. Inference converts predictions back to physical
+units before reporting metrics.
 
 HDF5 input schema (written by `data_processors/h5_maker_qm9.py` and
 extended with QFIM by the bioQINN pipeline):
@@ -201,21 +377,14 @@ Train/val/test splits live at
 
 ---
 
-## Legacy
+## Legacy Configs
 
-`networks/GNN/legacy/` and `configs/YAML/legacy/` hold pre-refactor code
-for reproducibility with the existing runs under
-`/ceph/mbinder/qm9-qinn/classical/saved_models/`:
-
-- `gnn_plain.py` — non-invariant MPNN baseline
-- `gnn_invariant.py` — invariant GNN with mean-reduced angle/dihedral
-  features and 128-dim hidden space
-- `gnn_qfim.py`, `gnn_qfim_structured.py`, `gnn_qfim_conv.py`,
-  `gnn_qfim_node.py`, `gnn_qfim_cij.py` — five QFIM injection variants
-  explored before unification
-
-Legacy modules are not wired into `train.py`. To run one, import from
-`networks.GNN.legacy.<module>` and dispatch manually.
+`configs/YAML/legacy/` holds pre-refactor configuration files for
+reproducibility with existing archived runs under
+`/ceph/mbinder/qm9-qinn/classical/saved_models/`. The corresponding
+pre-refactor model implementations have been removed from the active source
+tree; current experiments use the unified top-level modules in
+`networks/GNN/`.
 
 ---
 
