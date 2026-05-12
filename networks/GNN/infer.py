@@ -51,6 +51,11 @@ def main():
 
     preds = np.concatenate(preds)
     trues = np.concatenate(trues)
+    target_mean = np.asarray(test_loader.target_mean, dtype=np.float64).reshape(-1)
+    target_std = np.asarray(test_loader.target_std, dtype=np.float64).reshape(-1)
+    if target_mean.size == 1:
+        preds = preds * target_std[0] + target_mean[0]
+        trues = trues * target_std[0] + target_mean[0]
     mae = float(np.mean(np.abs(preds - trues)))
     rmse = float(np.sqrt(np.mean((preds - trues) ** 2)))
     logger.info(f"test MAE={mae:.4f} | RMSE={rmse:.4f} | N={len(preds)}")

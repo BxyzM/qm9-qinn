@@ -28,7 +28,16 @@ from tqdm import tqdm
 
 from configs.configuration import Config
 from data_handlers.qm9_graph_loader import build_loaders_from_config
-from networks.GNN import GNN, QFIMGNN
+from networks.GNN import (
+    DimeNetPP,
+    DimeNetPPQFIM,
+    GNN,
+    QFIMGNN,
+    QFIMAttnGNN,
+    QFIMBondAttnGNN,
+    QFIMBondGateGNN,
+    QFIMResidualGNN,
+)
 
 
 def _build_model(config) -> nn.Module:
@@ -39,22 +48,77 @@ def _build_model(config) -> nn.Module:
     mlp_residual = bool(getattr(config.model, "mlp_residual", False))
     msg_layers = int(getattr(config.model, "msg_layers", 1))
     per_layer_edge_update = bool(getattr(config.model, "per_layer_edge_update", False))
+    node_mlp_dims = tuple(getattr(config.model, "node_mlp_dims", (19, 32, 64, 64, 32)))
+    edge_mlp_dims = tuple(getattr(config.model, "edge_mlp_dims", (28, 32, 32, 16, 8)))
+    max_neighbors = int(getattr(config.model, "max_neighbors", 3))
+    max_chains = int(getattr(config.model, "max_chains", 9))
 
     if mt == "gnn":
         return GNN(
             num_mp_layers=num_mp_layers,
+            node_mlp_dims=node_mlp_dims,
+            edge_mlp_dims=edge_mlp_dims,
+            max_neighbors=max_neighbors,
+            max_chains=max_chains,
             pooling=pooling,
             activation=activation,
             mlp_residual=mlp_residual,
             msg_layers=msg_layers,
             per_layer_edge_update=per_layer_edge_update,
         )
+    if mt == "dimenet_pp":
+        return DimeNetPP(
+            hidden_channels=int(getattr(config.model, "hidden_channels", 128)),
+            out_channels=int(getattr(config.model, "out_channels", 1)),
+            num_blocks=int(getattr(config.model, "num_blocks", 4)),
+            int_emb_size=int(getattr(config.model, "int_emb_size", 64)),
+            basis_emb_size=int(getattr(config.model, "basis_emb_size", 8)),
+            out_emb_channels=int(getattr(config.model, "out_emb_channels", 256)),
+            num_spherical=int(getattr(config.model, "num_spherical", 7)),
+            num_radial=int(getattr(config.model, "num_radial", 6)),
+            cutoff=float(getattr(config.model, "cutoff", 5.0)),
+            max_num_neighbors=int(getattr(config.model, "max_num_neighbors", 32)),
+            envelope_exponent=int(getattr(config.model, "envelope_exponent", 5)),
+            num_before_skip=int(getattr(config.model, "num_before_skip", 1)),
+            num_after_skip=int(getattr(config.model, "num_after_skip", 2)),
+            num_output_layers=int(getattr(config.model, "num_output_layers", 3)),
+            act=str(getattr(config.model, "act", "swish")),
+            output_initializer=str(getattr(config.model, "output_initializer", "zeros")),
+        )
+    if mt == "dimenet_pp_qfim":
+        return DimeNetPPQFIM(
+            hidden_channels=int(getattr(config.model, "hidden_channels", 128)),
+            out_channels=int(getattr(config.model, "out_channels", 1)),
+            num_blocks=int(getattr(config.model, "num_blocks", 4)),
+            int_emb_size=int(getattr(config.model, "int_emb_size", 64)),
+            basis_emb_size=int(getattr(config.model, "basis_emb_size", 8)),
+            out_emb_channels=int(getattr(config.model, "out_emb_channels", 256)),
+            num_spherical=int(getattr(config.model, "num_spherical", 7)),
+            num_radial=int(getattr(config.model, "num_radial", 6)),
+            cutoff=float(getattr(config.model, "cutoff", 5.0)),
+            max_num_neighbors=int(getattr(config.model, "max_num_neighbors", 32)),
+            envelope_exponent=int(getattr(config.model, "envelope_exponent", 5)),
+            num_before_skip=int(getattr(config.model, "num_before_skip", 1)),
+            num_after_skip=int(getattr(config.model, "num_after_skip", 2)),
+            num_output_layers=int(getattr(config.model, "num_output_layers", 3)),
+            act=str(getattr(config.model, "act", "swish")),
+            output_initializer=str(getattr(config.model, "output_initializer", "zeros")),
+            qfim_per_qubit_dim=int(config.qfim.per_qubit_dim),
+            qfim_embed_op=str(getattr(config.qfim, "embed_op", "conv2d")),
+            qfim_out_dim=int(getattr(config.qfim, "out_dim", 8)),
+            qfim_head_normalize=bool(getattr(config.qfim, "head_normalize", False)),
+            qfim_residual_gate_init=float(getattr(config.qfim, "residual_gate_init", 0.0)),
+            qfim_rescale_beta=float(getattr(config.qfim, "rescale_beta", 1.0)),
+        )
     if mt == "gnn_qfim":
         pd = int(config.qfim.per_qubit_dim)
         embed_op = str(getattr(config.qfim, "embed_op", "mlp"))
         out_dim = int(getattr(config.qfim, "out_dim", 4))
+        head_normalize = bool(getattr(config.qfim, "head_normalize", False))
         return QFIMGNN(
             num_mp_layers=num_mp_layers,
+            node_mlp_dims=node_mlp_dims,
+            edge_mlp_dims=edge_mlp_dims,
             pooling=pooling,
             activation=activation,
             mlp_residual=mlp_residual,
@@ -63,12 +127,127 @@ def _build_model(config) -> nn.Module:
             qfim_per_qubit_dim=pd,
             qfim_embed_op=embed_op,
             qfim_out_dim=out_dim,
+            qfim_head_normalize=head_normalize,
+        )
+    if mt == "gnn_qfim_residual":
+        pd = int(config.qfim.per_qubit_dim)
+        embed_op = str(getattr(config.qfim, "embed_op", "conv2d"))
+        out_dim = int(getattr(config.qfim, "out_dim", 8))
+        head_normalize = bool(getattr(config.qfim, "head_normalize", False))
+        residual_gate_init = float(getattr(config.qfim, "residual_gate_init", 0.0))
+        full_conv_kernel = int(getattr(config.qfim, "full_conv_kernel", 7))
+        full_conv_channels = int(getattr(config.qfim, "full_conv_channels", 16))
+        alpha_mode = str(getattr(config.qfim, "alpha_mode", "shared"))
+        edge_gate = bool(getattr(config.qfim, "edge_gate", False))
+        use_geom = bool(getattr(config.qfim, "use_geom", False))
+        qfim_mode = str(getattr(config.qfim, "mode", "additive"))
+        qfim_msg_layers = getattr(config.qfim, "msg_layers", None)
+        if qfim_msg_layers is not None:
+            qfim_msg_layers = int(qfim_msg_layers)
+        qfim_branch_dropout = float(getattr(config.qfim, "branch_dropout", 0.0))
+        qfim_rescale_beta = float(getattr(config.qfim, "rescale_beta", 1.0))
+        return QFIMResidualGNN(
+            num_mp_layers=num_mp_layers,
+            node_mlp_dims=node_mlp_dims,
+            edge_mlp_dims=edge_mlp_dims,
+            max_neighbors=max_neighbors,
+            max_chains=max_chains,
+            pooling=pooling,
+            activation=activation,
+            mlp_residual=mlp_residual,
+            msg_layers=msg_layers,
+            per_layer_edge_update=per_layer_edge_update,
+            qfim_n_qubits=int(config.qfim.n_qubits),
+            qfim_per_qubit_dim=pd,
+            qfim_embed_op=embed_op,
+            qfim_out_dim=out_dim,
+            qfim_head_normalize=head_normalize,
+            qfim_residual_gate_init=residual_gate_init,
+            qfim_full_conv_kernel=full_conv_kernel,
+            qfim_full_conv_channels=full_conv_channels,
+            qfim_alpha_mode=alpha_mode,
+            qfim_edge_gate=edge_gate,
+            qfim_use_geom=use_geom,
+            qfim_mode=qfim_mode,
+            qfim_msg_layers=qfim_msg_layers,
+            qfim_branch_dropout=qfim_branch_dropout,
+            qfim_rescale_beta=qfim_rescale_beta,
+        )
+    if mt == "gnn_qfim_attn":
+        pd = int(config.qfim.per_qubit_dim)
+        beta_init = float(getattr(config.qfim, "attn_beta_init", 1.0))
+        edge_dim = int(getattr(config.qfim, "edge_dim", 16))
+        attn_uniform = bool(getattr(config.qfim, "attn_uniform", False))
+        gate_mode = str(getattr(config.qfim, "gate_mode", "softmax"))
+        gate_alpha_init = float(getattr(config.qfim, "gate_alpha_init", 1.0))
+        gate_theta_init = float(getattr(config.qfim, "gate_theta_init", 0.0))
+        return QFIMAttnGNN(
+            num_mp_layers=num_mp_layers,
+            node_mlp_dims=node_mlp_dims,
+            edge_mlp_dims=edge_mlp_dims,
+            pooling=pooling,
+            activation=activation,
+            mlp_residual=mlp_residual,
+            msg_layers=msg_layers,
+            per_layer_edge_update=per_layer_edge_update,
+            qfim_per_qubit_dim=pd,
+            qfim_attn_beta_init=beta_init,
+            qfim_edge_dim=edge_dim,
+            attn_uniform=attn_uniform,
+            gate_mode=gate_mode,
+            gate_alpha_init=gate_alpha_init,
+            gate_theta_init=gate_theta_init,
+        )
+    if mt == "gnn_qfim_bond_attn":
+        pd = int(config.qfim.per_qubit_dim)
+        beta_init = float(getattr(config.qfim, "attn_beta_init", 1.0))
+        return QFIMBondAttnGNN(
+            num_mp_layers=num_mp_layers,
+            node_mlp_dims=node_mlp_dims,
+            edge_mlp_dims=edge_mlp_dims,
+            pooling=pooling,
+            activation=activation,
+            mlp_residual=mlp_residual,
+            msg_layers=msg_layers,
+            per_layer_edge_update=per_layer_edge_update,
+            qfim_per_qubit_dim=pd,
+            qfim_attn_beta_init=beta_init,
+        )
+    if mt == "gnn_qfim_bond_gate":
+        pd = int(config.qfim.per_qubit_dim)
+        beta_init = float(getattr(config.qfim, "gate_beta_init", 1.0))
+        alpha_init = float(getattr(config.qfim, "gate_alpha_init", 0.0))
+        theta_init = float(getattr(config.qfim, "gate_theta_init", 0.0))
+        return QFIMBondGateGNN(
+            num_mp_layers=num_mp_layers,
+            node_mlp_dims=node_mlp_dims,
+            edge_mlp_dims=edge_mlp_dims,
+            pooling=pooling,
+            activation=activation,
+            mlp_residual=mlp_residual,
+            msg_layers=msg_layers,
+            per_layer_edge_update=per_layer_edge_update,
+            qfim_per_qubit_dim=pd,
+            qfim_gate_beta_init=beta_init,
+            qfim_gate_alpha_init=alpha_init,
+            qfim_gate_theta_init=theta_init,
         )
     raise ValueError(f"Unknown model.type={mt!r}")
 
 
 def _forward(model: nn.Module, batch, model_type: str) -> torch.Tensor:
-    if model_type == "gnn_qfim":
+    if model_type == "dimenet_pp":
+        return model(batch.x, batch.batch)
+    if model_type == "dimenet_pp_qfim":
+        nq = int(batch.qfim_nq[0].item())
+        return model(batch.x, batch.qfim_block, nq, batch.batch)
+    if model_type in (
+        "gnn_qfim",
+        "gnn_qfim_attn",
+        "gnn_qfim_bond_attn",
+        "gnn_qfim_bond_gate",
+        "gnn_qfim_residual",
+    ):
         nq = int(batch.qfim_nq[0].item())
         return model(
             batch.x, batch.edge_index, batch.edge_attr,
@@ -131,15 +310,11 @@ def main():
         f"Model {config.model.type} | params={sum(p.numel() for p in model.parameters()):,}"
     )
 
-    # Fit target standardization stats on the training split only. For
-    # InvariantGNN these live as buffers that travel with state_dict so
-    # checkpoints / infer runs don't need a separate stats file. For other
-    # models fit_target_stats is a no-op.
-    if hasattr(model, "fit_target_stats"):
-        mean, std = model.fit_target_stats(train_loader)
-        logger.info("=" * 72)
-        logger.info(f"target normalization | mean={mean:.6f} | std={std:.6f}")
-        logger.info("=" * 72)
+    logger.info(
+        "targets standardized in dataloader | "
+        f"mean={train_loader.target_mean} | std={train_loader.target_std} "
+        f"| count={train_loader.target_stats_count}"
+    )
 
     loss_name = getattr(config.loss, "name", "huber")
     if loss_name == "mse":
@@ -150,7 +325,8 @@ def main():
         loss_fn = nn.HuberLoss(delta=float(getattr(config.loss, "delta", 0.1)))
 
     lr = float(config.optimizer.lr)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    weight_decay = float(getattr(config.optimizer, "weight_decay", 0.0))
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     schedule_kind = str(getattr(config.optimizer, "schedule", "plateau")).lower()
     if schedule_kind == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -175,9 +351,12 @@ def main():
             return min_ratio + (1.0 - min_ratio) * cos
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
+    elif schedule_kind in ("none", "constant"):
+        scheduler = None
     else:
         raise ValueError(
-            f"optimizer.schedule must be 'plateau' or 'cosine'; got {schedule_kind!r}"
+            "optimizer.schedule must be 'plateau', 'cosine', or 'none'; "
+            f"got {schedule_kind!r}"
         )
 
     model_dir = pathlib.Path(config.paths.model_dir) / config.setup.run_id
@@ -201,15 +380,39 @@ def main():
         best_val = float("inf")
         best_val_mae = float("inf")
         epochs_since_mae_improved = 0
+        epochs = int(config.setup.epochs)
         # ------------------------ Early stopping --------------------------
         #
-        # Early stopping on val_mae. Patience = N epochs with no improvement
-        # over the best-so-far val_mae before we stop. Disable by setting
-        # setup.early_stop_patience to 0 (or leaving it absent with <=0).
+        # Stop on val_mae if it does not improve by at least
+        # setup.early_stop_min_delta_mev. Patience is capped at 10% of the
+        # allowed epochs. Disable by setting setup.early_stop_patience <= 0.
         #
         # ------------------------------------------------------------------
-        early_stop_patience = int(getattr(config.setup, "early_stop_patience", 10))
-        epochs = int(config.setup.epochs)
+        configured_patience = int(getattr(config.setup, "early_stop_patience", 10))
+        max_patience = max(1, math.ceil(0.10 * epochs))
+        early_stop_patience = (
+            min(configured_patience, max_patience)
+            if configured_patience > 0
+            else 0
+        )
+        min_delta_mev = float(getattr(config.setup, "early_stop_min_delta_mev", 0.0))
+        if min_delta_mev < 0.0:
+            raise ValueError("setup.early_stop_min_delta_mev must be >= 0")
+        if min_delta_mev > 15.0:
+            logger.warning(
+                f"early_stop_min_delta_mev={min_delta_mev:.3f} exceeds 15 meV; "
+                "capping to 15 meV"
+            )
+            min_delta_mev = 15.0
+        target_std0 = float(torch.as_tensor(train_loader.target_std).view(-1)[0].item())
+        early_stop_min_delta = min_delta_mev / (target_std0 * 1000.0)
+        logger.info(
+            "early stopping | "
+            f"patience={early_stop_patience} "
+            f"(configured={configured_patience}, max_10pct={max_patience}) | "
+            f"min_delta={min_delta_mev:.3f} meV "
+            f"({early_stop_min_delta:.6f} normalized)"
+        )
         save_every_epoch = bool(getattr(config.setup, "save_every_epoch", False))
         for epoch in range(1, epochs + 1):
             t0 = time.time()
@@ -223,7 +426,7 @@ def main():
             )
             if schedule_kind == "plateau":
                 scheduler.step(val_loss)
-            else:
+            elif scheduler is not None:
                 scheduler.step()
             dt = time.time() - t0
             current_lr = opt.param_groups[0]["lr"]
@@ -267,7 +470,7 @@ def main():
             # they were (best.pt still tracks val_loss); this only controls
             # the training loop termination.
             # ---------------------------------------------------------------
-            if val_mae < best_val_mae:
+            if val_mae < best_val_mae - early_stop_min_delta:
                 best_val_mae = val_mae
                 epochs_since_mae_improved = 0
             else:
@@ -279,8 +482,8 @@ def main():
             ):
                 logger.info(
                     f"early stopping at epoch {epoch} | "
-                    f"val_mae did not improve for {early_stop_patience} epochs | "
-                    f"best_val_mae={best_val_mae:.4f}"
+                    f"val_mae did not improve by at least {min_delta_mev:.3f} meV "
+                    f"for {early_stop_patience} epochs | best_val_mae={best_val_mae:.4f}"
                 )
                 break
 
