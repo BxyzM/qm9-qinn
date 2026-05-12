@@ -129,6 +129,10 @@ class QM9GraphDataset(Dataset):
         qfim_shape: Optional[Tuple[int, int]] = None,
         target_mean: Optional[Sequence[float]] = None,
         target_std: Optional[Sequence[float]] = None,
+        qfim_ablation_mode: str = "none",
+        qfim_ablation_seed: int = 42,
+        qfim_random_scale: float = 0.25,
+        use_all_atoms: bool = False,
     ) -> None:
         """
         Args:
@@ -138,10 +142,23 @@ class QM9GraphDataset(Dataset):
                          rot-gate block. Required to enable QFIM features.
             target_mean: Train-split mean for selected targets.
             target_std:  Train-split std for selected targets.
+            qfim_ablation_mode:
+                         none | row_shuffle | random | zero. Controls only the
+                         QFIM tensor; graph rows and targets stay unchanged.
+            use_all_atoms: If true, include hydrogens and use n_atoms[:, 0].
+                           Default false preserves the heavy-atom-only setup.
         """
         self.h5_path = str(h5_path)
         self.target_indices = _resolve_target_indices(target_keys)
         self.qfim_shape = qfim_shape
+        self.use_all_atoms = bool(use_all_atoms)
+        self.qfim_ablation_mode = str(qfim_ablation_mode).lower()
+        if self.qfim_ablation_mode not in ("none", "row_shuffle", "random", "zero"):
+            raise ValueError(
+                "qfim_ablation_mode must be one of: none, row_shuffle, random, zero"
+            )
+        self.qfim_ablation_seed = int(qfim_ablation_seed)
+        self.qfim_random_scale = float(qfim_random_scale)
         self.target_mean = (
             np.asarray(target_mean, dtype=np.float32).reshape(-1)
             if target_mean is not None
@@ -174,14 +191,31 @@ class QM9GraphDataset(Dataset):
 
         self._h5: Optional[h5py.File] = None
         self._indices: Optional[np.ndarray] = None
+        self._qfim_row_perm: Optional[np.ndarray] = None
 
         if self._qfim_in_h5 and self.qfim_shape is None:
             self._qfim_in_h5 = False
+        if self.use_all_atoms and self._qfim_in_h5:
+            nq = int(self.qfim_shape[0]) if self.qfim_shape is not None else 0
+            if nq < self.max_nodes:
+                raise ValueError(
+                    "use_all_atoms=True is not compatible with edge-level QFIM "
+                    f"for this file: qfim.n_qubits={nq}, max_nodes={self.max_nodes}. "
+                    "Run all-atom baselines with qfim disabled, or provide an "
+                    "all-atom QFIM tensor."
+                )
+        if self._qfim_in_h5 and self.qfim_ablation_mode == "row_shuffle":
+            rng = np.random.default_rng(self.qfim_ablation_seed)
+            perm = rng.permutation(self.n_samples)
+            self._qfim_row_perm = perm.astype(np.int64, copy=False)
         logger.info(
             f"QM9GraphDataset: {len(self)} molecules"
             f"{f' ({self.n_samples} raw)' if self._indices is not None else ''} | "
             f"node_dim={self.node_dim} | max_nodes={self.max_nodes} | "
-            f"qfim={'yes' if self._qfim_in_h5 else 'no'} | path={self.h5_path}"
+            f"atoms={'all' if self.use_all_atoms else 'heavy'} | "
+            f"qfim={'yes' if self._qfim_in_h5 else 'no'}"
+            f"{f' ({self.qfim_ablation_mode})' if self._qfim_in_h5 else ''} | "
+            f"path={self.h5_path}"
         )
 
     def _reset_handles(self) -> None:
@@ -206,10 +240,11 @@ class QM9GraphDataset(Dataset):
         if self._indices is not None:
             idx = int(self._indices[idx])
 
+        n_total = int(self._h5["n_atoms"][idx, 0])
         n_heavy = int(self._h5["n_atoms"][idx, 1])
-        # Slice only the heavy-atom block; dense zeros beyond are padding.
-        nodes = self._h5["node_features"][idx, :n_heavy]                     # (H, 9)
-        edges = self._h5["edge_features"][idx, :n_heavy, :n_heavy]           # (H, H, 4)
+        n_nodes = n_total if self.use_all_atoms else n_heavy
+        nodes = self._h5["node_features"][idx, :n_nodes]                     # (N, 9)
+        edges = self._h5["edge_features"][idx, :n_nodes, :n_nodes]           # (N, N, 4)
         raw_target = np.asarray(self._h5["targets"][idx])
         if raw_target.ndim == 0:
             if len(self.target_indices) != 1:
@@ -236,7 +271,9 @@ class QM9GraphDataset(Dataset):
             edge_index=edge_idx.long(),
             edge_attr=edge_attr,
             y=target_t,
+            n_total=torch.tensor([n_total], dtype=torch.long),
             n_heavy=torch.tensor([n_heavy], dtype=torch.long),
+            n_nodes=torch.tensor([n_nodes], dtype=torch.long),
         )
 
         # Full rot-gate QFIM sub-block per molecule: (n_qubits, n_qubits, pd, pd).
@@ -245,9 +282,24 @@ class QM9GraphDataset(Dataset):
         if self._qfim_in_h5 and self.qfim_shape is not None:
             nq, pd = self.qfim_shape
             n_rot = nq * pd
-            rot_block = np.asarray(
-                self._h5["qfim"][idx, :n_rot, :n_rot], dtype=np.float32
-            )
+            qfim_idx = idx
+            if self._qfim_row_perm is not None:
+                qfim_idx = int(self._qfim_row_perm[idx])
+
+            if self.qfim_ablation_mode == "zero":
+                rot_block = np.zeros((n_rot, n_rot), dtype=np.float32)
+            elif self.qfim_ablation_mode == "random":
+                rng = np.random.default_rng(self.qfim_ablation_seed + idx)
+                rot_block = rng.uniform(
+                    low=-self.qfim_random_scale,
+                    high=self.qfim_random_scale,
+                    size=(n_rot, n_rot),
+                ).astype(np.float32)
+                rot_block = 0.5 * (rot_block + rot_block.T)
+            else:
+                rot_block = np.asarray(
+                    self._h5["qfim"][qfim_idx, :n_rot, :n_rot], dtype=np.float32
+                )
             # bioQINN stores rot-gate weights as (num_layers, ops_per_layer,
             # n_qubits) and PennyLane's metric_tensor flattens in C order, so
             # the qubit axis is the FASTEST-varying one along the 60-dim flat
@@ -281,6 +333,10 @@ def build_loader(
     qfim_shape: Optional[Tuple[int, int]] = None,
     target_mean: Optional[Sequence[float]] = None,
     target_std: Optional[Sequence[float]] = None,
+    qfim_ablation_mode: str = "none",
+    qfim_ablation_seed: int = 42,
+    qfim_random_scale: float = 0.25,
+    use_all_atoms: bool = False,
     max_samples: Optional[int] = None,
     seed: int = 42,
     pin_memory: bool = True,
@@ -292,6 +348,10 @@ def build_loader(
         qfim_shape=qfim_shape,
         target_mean=target_mean,
         target_std=target_std,
+        qfim_ablation_mode=qfim_ablation_mode,
+        qfim_ablation_seed=qfim_ablation_seed,
+        qfim_random_scale=qfim_random_scale,
+        use_all_atoms=use_all_atoms,
     )
     if max_samples is not None and max_samples < len(dataset):
         rng = np.random.default_rng(seed)
@@ -324,11 +384,34 @@ def build_loaders_from_config(config: Any) -> Any:
     num_workers = int(getattr(config.setup, "num_workers", 4))
     seed = int(getattr(config.setup, "seed", 42))
     shuffle = bool(getattr(config.setup, "shuffle", True))
+    data_cfg = getattr(config, "data", None)
+    use_all_atoms = bool(
+        getattr(
+            data_cfg,
+            "use_all_atoms",
+            getattr(config.setup, "use_all_atoms", False),
+        )
+    )
 
     qfim_cfg = getattr(config, "qfim", None)
     qfim_shape: Optional[Tuple[int, int]] = None
     if qfim_cfg is not None:
         qfim_shape = (int(qfim_cfg.n_qubits), int(qfim_cfg.per_qubit_dim))
+    qfim_ablation_mode = (
+        str(getattr(qfim_cfg, "ablation_mode", "none"))
+        if qfim_cfg is not None
+        else "none"
+    )
+    qfim_ablation_seed = (
+        int(getattr(qfim_cfg, "ablation_seed", seed))
+        if qfim_cfg is not None
+        else seed
+    )
+    qfim_random_scale = (
+        float(getattr(qfim_cfg, "random_scale", 0.25))
+        if qfim_cfg is not None
+        else 0.25
+    )
 
     target_mean, target_std, target_count = target_stats_for_keys(
         config.paths.train,
@@ -350,6 +433,10 @@ def build_loaders_from_config(config: Any) -> Any:
             qfim_shape=qfim_shape,
             target_mean=target_mean,
             target_std=target_std,
+            qfim_ablation_mode=qfim_ablation_mode,
+            qfim_ablation_seed=qfim_ablation_seed,
+            qfim_random_scale=qfim_random_scale,
+            use_all_atoms=use_all_atoms,
             max_samples=getattr(config.setup, "train_n", None),
             seed=seed,
         )
@@ -363,6 +450,10 @@ def build_loaders_from_config(config: Any) -> Any:
             qfim_shape=qfim_shape,
             target_mean=target_mean,
             target_std=target_std,
+            qfim_ablation_mode=qfim_ablation_mode,
+            qfim_ablation_seed=qfim_ablation_seed + 1,
+            qfim_random_scale=qfim_random_scale,
+            use_all_atoms=use_all_atoms,
             max_samples=getattr(config.setup, "val_n", None),
             seed=seed,
         )
@@ -381,6 +472,10 @@ def build_loaders_from_config(config: Any) -> Any:
         qfim_shape=qfim_shape,
         target_mean=target_mean,
         target_std=target_std,
+        qfim_ablation_mode=qfim_ablation_mode,
+        qfim_ablation_seed=qfim_ablation_seed + 2,
+        qfim_random_scale=qfim_random_scale,
+        use_all_atoms=use_all_atoms,
         max_samples=getattr(config.setup, "test_n", None),
         seed=seed,
     )
